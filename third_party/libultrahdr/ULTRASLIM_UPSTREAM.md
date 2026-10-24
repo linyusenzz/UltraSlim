@@ -87,3 +87,22 @@ correctly in iPhone Photos; this confirms that sample, not all possible inputs.
 The source changes from `924967a759`, `2472ff7ad1`, and `b4880a1c21` have now been applied to the vendored snapshot, retaining the existing local changes. `native/host_test/upstream_color.cpp` covers distinct RGB channel writes, ARM NEON versus scalar P3/BT.2020/BT.709 conversion, and public HEIC/AVIF encoding with sRGB transfer 13. Existing roundtrip/preservation suites also pass.
 
 This is still v2.0.2 with selective backports, not a full main upgrade. The ISO metadata-layout rewrite was not included. App export still uses the existing preserve/compatible path; it was not switched to HDR-only rebuild.
+
+## ISO metadata-layout commit d911e4b6: verified no-op for our outputs (2026-10-25)
+
+Upstream `d911e4b6dd873a1bee5e6a782a71d7623e2b5f69` ("gainmap: write final ISO
+metadata layout") removes the common-denominator compact form and the
+backward-direction flag, and pins expected bytes in
+`tests/gainmapmetadata_test.cpp` (61 bytes single-channel, 141 three-channel).
+Verified against the vendored v2.0.2 writer:
+
+- Flag masks are unchanged between v2.0.2 and main: `kIsMultiChannelMask` =
+  bit 7, `kUseBaseColorSpaceMask` = bit 6 (`lib/include/ultrahdr/gainmapmetadata.h`
+  is byte-identical in both).
+- Our preserve path never emits the compact form (observed tmap blobs are full
+  numerator/denominator pairs, flags 0x40) and never uses backward direction, so
+  the serialized bytes are identical under both layouts. Upgrading for
+  d911e4b6 alone buys no compatibility change; the earlier "ISO 布局未合入"
+  concern does not apply to files we produce. Checked while investigating the
+  2026-10-25 Google Photos HEIC HBM issue (see AGENTS.md); conclusion there:
+  renderer-side variance, not our metadata serialization.

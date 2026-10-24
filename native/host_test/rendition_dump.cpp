@@ -97,6 +97,7 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> pixels(raw->w * raw->h * 4);
       const size_t srcStride = static_cast<size_t>(raw->stride[0]);
       double linSum[3] = {0.0, 0.0, 0.0};
+      size_t overSdrWhite = 0, overStrong = 0, overPeak = 0, totalPx = 0;
       {
         const uint32_t* p32 = reinterpret_cast<const uint32_t*>(raw->planes[0]);
         uint32_t mx = 0;
@@ -116,6 +117,12 @@ int main(int argc, char** argv) {
           c.r = (px & 0x3FF) / 1023.0f;
           c.g = ((px >> 10) & 0x3FF) / 1023.0f;
           c.b = ((px >> 20) & 0x3FF) / 1023.0f;
+          // HLG 信号 0.75 ≈ SDR 参考白（203nit），0.9 以上为强高光，1.0 = 1000nit 峰值
+          float sig = std::max(c.r, std::max(c.g, c.b));
+          totalPx++;
+          if (sig > 0.75f) overSdrWhite++;
+          if (sig > 0.90f) overStrong++;
+          if (sig >= 0.999f) overPeak++;
           c = ultrahdr::hlgInvOetf(c);
           linSum[0] += c.r;
           linSum[1] += c.g;
@@ -138,6 +145,8 @@ int main(int argc, char** argv) {
       printf("hdr: %zux%zu cg=%d ct=%d  linearMean=[%.4f %.4f %.4f]\n", raw->w, raw->h, raw->cg,
              raw->ct, linSum[0] / (raw->w * raw->h), linSum[1] / (raw->w * raw->h),
              linSum[2] / (raw->w * raw->h));
+      printf("hdr高光: >0.75(SDR白)=%.3f%%  >0.90=%.3f%%  ≈1.0(峰值)=%.3f%%\n",
+             100.0 * overSdrWhite / totalPx, 100.0 * overStrong / totalPx, 100.0 * overPeak / totalPx);
     } else {
       fprintf(stderr, "hdr decode failed\n");
     }
