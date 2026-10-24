@@ -65,10 +65,83 @@ class MotionPhotoTest {
         assertTrue(packet.contains("Camera:MotionPhotoPresentationTimestampUs=\"77\""))
     }
 
+    @Test fun avifMotionPhotoUsesMpvdBoxAndIsDetected() {
+        val movie = video(262144)
+        val info = MotionPhotoInfo(-1, movie.size.toLong(), 0)
+        val xmp = MotionPhotoContainer.xmp(info, "image/avif").toString(Charsets.UTF_8)
+        assertTrue(xmp.contains("Item:Mime=\"image/avif\""))
+        assertTrue(xmp.contains("Item:Padding=\"8\""))
+        val still = box("ftyp", "avif0000".toByteArray()) + box("meta", ByteArray(8))
+        // 规范要求 ISO 容器主图（HEIC/AVIF）把视频装在末尾的 mpvd box 里；XMP 的 Length 从 mpvd 载荷起算。
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), still.size + 8L), detect(still + box("mpvd", movie), xmp))
+    }
+
     @Test fun truncatedOrFtypOnlyVideosAreRejected() {
         val still = box("ftyp", "heic0000".toByteArray())
         assertNull(detect(still + box("mpvd", video(1024)).dropLast(1)))
         assertNull(detect(still + box("mpvd", box("ftyp", "isom0000".toByteArray()))))
+    }
+
+    @Test fun vendorConcatWithoutXmpIsDetected() {
+        val movie = video(262144)
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), jpeg().size.toLong()), detect(jpeg() + movie))
+        val still = box("ftyp", "heic0000".toByteArray())
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), still.size.toLong()), detect(still + movie))
+    }
+
+    private fun jpegWithRawXmp(xmp: String): ByteArray {
+        val payload = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray() + xmp.toByteArray()
+        val segment = ByteBuffer.allocate(payload.size + 4).putShort(0xffe1.toShort())
+            .putShort((payload.size + 2).toShort()).put(payload).array()
+        return byteArrayOf(-1, -40) + segment + byteArrayOf(-1, -39)
+    }
+
+    private fun oppoXmp(containerLength: Int, videoLength: Int): String =
+        """<x:xmpmeta xmlns:x='adobe:ns:meta/' xmlns:r='http://www.w3.org/1999/02/22-rdf-syntax-ns#' xmlns:c='http://ns.google.com/photos/1.0/camera/' xmlns:k='http://ns.google.com/photos/1.0/container/' xmlns:i='http://ns.google.com/photos/1.0/container/item/' xmlns:o='http://ns.oplus.com/photos/1.0/camera/'><r:RDF><r:Description c:MotionPhoto='1' o:VideoLength='$videoLength'><k:Directory><r:Seq><r:li r:parseType='Resource'><k:Item i:Mime='image/jpeg' i:Semantic='Primary'/></r:li><r:li r:parseType='Resource'><k:Item i:Mime='video/mp4' i:Semantic='MotionPhoto' i:Length='$containerLength'/></r:li></r:Seq></k:Directory></r:Description></r:RDF></x:xmpmeta>"""
+
+    @Test fun oppoVendorBytesBeforeVideoAreSkipped() {
+        val movie = video(262144)
+        val padding = ByteArray(336) { (it + 1).toByte() }
+        val still = jpegWithRawXmp(oppoXmp(movie.size + padding.size, movie.size))
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), (still.size + padding.size).toLong()), detect(still + padding + movie))
+    }
+
+    @Test fun oppoTrailingVendorBytesAreExcluded() {
+        val movie = video(262144)
+        val trailing = ByteArray(336) { (it + 1).toByte() }
+        val still = jpegWithRawXmp(oppoXmp(movie.size + trailing.size, movie.size))
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), still.size.toLong()), detect(still + movie + trailing))
+    }
+
+    @Test fun oppoEnvelopeSecondVideoAndWatermarkTailAreExcluded() {
+        // Real Find N6 layout: Container MotionPhoto Length covers primary MP4 + device envelope
+        // + a second small MP4 + watermark JSON; the envelope header parses as a to-EOF box unless
+        // box types are validated as printable ASCII.
+        val primary = video(262144)
+        val second = video(65536)
+        val watermark = ByteArray(407) { (it + 5).toByte() }
+        val envelopeTail = 8 + 16 + second.size + watermark.size
+        val envelope = ByteBuffer.allocate(8 + 16).putInt(envelopeTail)
+            .put(byteArrayOf(0x9a.toByte(), 0x99.toByte(), 0x99.toByte(), 0x3f.toByte()))
+            .put("OPPO envelope".toByteArray()).array()
+        val still = jpegWithRawXmp(oppoXmp(primary.size + envelopeTail, primary.size))
+        assertEquals(
+            MotionPhotoInfo(-1, primary.size.toLong(), still.size.toLong()),
+            detect(still + primary + envelope + second + watermark)
+        )
+    }
+
+    @Test fun videoBehindVendorPaddingIsFoundByScan() {
+        val movie = video(131072)
+        val padding = ByteArray(512) { (it + 3).toByte() }
+        assertEquals(MotionPhotoInfo(-1, movie.size.toLong(), (jpeg().size + padding.size).toLong()), detect(jpeg() + padding + movie))
+    }
+
+    @Test fun plainStillsAndBrokenTailsAreNotMisdetected() {
+        assertNull(detect(jpeg()))
+        assertNull(detect(jpeg().copyOf(jpeg().size - 1) + ByteArray(64)))
+        assertNull(detect(box("ftyp", "heic0000".toByteArray()) + box("meta", ByteArray(8))))
+        assertNull(detect(jpeg() + video(4096) + byteArrayOf(1, 2, 3, 4)))
     }
 
     @Test fun exactCopyRejectsTruncation() {

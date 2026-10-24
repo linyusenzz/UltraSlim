@@ -27,18 +27,18 @@ object MotionPhotoHelper {
 
     /** A detected motion photo must either be preserved completely or fail without replacing the still. */
     fun attachMotionPhoto(context: Context, inputUri: Uri, outputFile: File, targetFormat: OutputFormat, info: MotionPhotoInfo): Boolean {
-        if (targetFormat != OutputFormat.JPEG && targetFormat != OutputFormat.HEIC) return false
+        if (targetFormat != OutputFormat.JPEG && targetFormat != OutputFormat.HEIC && targetFormat != OutputFormat.AVIF) return false
         require(outputFile.isFile && outputFile.length() > 0)
         val temp = File.createTempFile(outputFile.name, ".motion.tmp", outputFile.parentFile)
         try {
-            if (targetFormat == OutputFormat.HEIC) {
+            if (targetFormat != OutputFormat.JPEG) {
                 FileInputStream(outputFile).use { input -> temp.outputStream().use { input.copyTo(it) } }
             } else {
                 temp.writeBytes(MotionPhotoContainer.jpegWithXmp(outputFile.readBytes(), info))
             }
             val stillLength = temp.length()
             FileOutputStream(temp, true).use { output ->
-                if (targetFormat == OutputFormat.HEIC) {
+                if (targetFormat != OutputFormat.JPEG) {
                     require(info.videoLength <= 0xffffffffL - 8)
                     output.write(ByteBuffer.allocate(8).putInt((info.videoLength + 8).toInt()).putInt(0x6d707664).array())
                 }
@@ -46,7 +46,7 @@ object MotionPhotoHelper {
                 ParcelFileDescriptor.AutoCloseInputStream(fd).use { MotionPhotoContainer.copyVideo(it.channel, info, output) }
                 output.fd.sync()
             }
-            val padding = if (targetFormat == OutputFormat.HEIC) 8 else 0
+            val padding = if (targetFormat != OutputFormat.JPEG) 8 else 0
             check(temp.length() == stillLength + padding + info.videoLength) { "实况视频写入不完整" }
             val expectedOffset = stillLength + padding
             FileInputStream(temp).use { check(MotionPhotoContainer.validVideo(it.channel, expectedOffset, info.videoLength)) }

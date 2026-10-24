@@ -37,3 +37,4 @@ __pycache__/
 *.apk.idsig
 # Raw pixel dumps from device probes hold the user's photos; never commit them.
 *.raw
+样张/

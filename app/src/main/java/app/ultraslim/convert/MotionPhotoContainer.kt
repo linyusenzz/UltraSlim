@@ -22,6 +22,7 @@ internal object MotionPhotoContainer {
     private const val CAMERA = "http://ns.google.com/photos/1.0/camera/"
     private const val CONTAINER = "http://ns.google.com/photos/1.0/container/"
     private const val ITEM = "http://ns.google.com/photos/1.0/container/item/"
+    private const val OPLUS = "http://ns.oplus.com/photos/1.0/camera/"
     private const val RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
     private val xmpHeader = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray()
 
@@ -39,11 +40,13 @@ internal object MotionPhotoContainer {
         return (0 until nodes.length).map { nodes.item(it) as Element }
     }
 
-    private fun property(doc: Document, name: String): String? {
+    private fun property(doc: Document, name: String): String? = propertyIn(doc, CAMERA, name)
+
+    private fun propertyIn(doc: Document, namespace: String, name: String): String? {
         elements(doc, RDF, "Description").forEach {
-            if (it.hasAttributeNS(CAMERA, name)) return it.getAttributeNS(CAMERA, name)
+            if (it.hasAttributeNS(namespace, name)) return it.getAttributeNS(namespace, name)
         }
-        return elements(doc, CAMERA, name).firstOrNull()?.textContent
+        return elements(doc, namespace, name).firstOrNull()?.textContent
     }
 
     fun read(channel: FileChannel, offset: Long, size: Int): ByteArray {
@@ -59,6 +62,9 @@ internal object MotionPhotoContainer {
     private fun box(channel: FileChannel, offset: Long, end: Long): Box? {
         if (offset < 0 || end - offset < 8) return null
         val bytes = read(channel, offset, 8)
+        // Box types are printable ASCII; vendor envelope bytes must not masquerade as a
+        // to-EOF box and swallow trailing content past structural validation.
+        if ((4..7).any { val v = bytes[it].toInt() and 0xff; v < 0x20 || v > 0x7e }) return null
         var size = ByteBuffer.wrap(bytes).int.toLong() and 0xffffffffL
         var header = 8
         if (size == 1L) {
@@ -102,38 +108,64 @@ internal object MotionPhotoContainer {
             }?.getAttributeNS(ITEM, "Length")?.toLongOrNull()
                 ?: property(d, "MicroVideoOffset")?.toLongOrNull()
         }
+        // OPPO declares the whole vendor tail (second small MP4, device envelope, watermark JSON)
+        // inside the Container MotionPhoto item — the envelope even parses as a to-EOF box — while
+        // its own VideoLength slices exactly the primary MP4. VideoLength also disagrees when
+        // padding rides inside the declared item. Trust the vendor length first, aligned to either
+        // end of the declared region, every candidate gated by validVideo.
+        val oplusLength = doc?.let { propertyIn(it, OPLUS, "VideoLength")?.toLongOrNull() }
+        if (oplusLength != null && oplusLength in 1 until size) {
+            val regionStart = if (length != null && length in 1 until size) size - length else null
+            for (start in listOfNotNull(regionStart, size - oplusLength).distinct()) {
+                if (validVideo(channel, start, oplusLength)) return MotionPhotoInfo(timestamp, oplusLength, start)
+            }
+        }
         if (length != null && length > 0 && length < size && validVideo(channel, size - length, length)) {
             return MotionPhotoInfo(timestamp, length, size - length)
         }
         if (!jpeg) {
             var pos = 0L
+            var appendedFtyp = -1L
+            var boxesReachEof = true
             while (pos < size) {
-                val b = box(channel, pos, size) ?: break
+                val b = box(channel, pos, size)
+                if (b == null) {
+                    boxesReachEof = false
+                    break
+                }
                 if (b.type == "mpvd" && pos + b.size == size) {
                     val offset = pos + b.header
                     if (validVideo(channel, offset, b.size - b.header))
                         return MotionPhotoInfo(timestamp, b.size - b.header, offset)
                 }
+                if (b.type == "ftyp" && pos > 0) appendedFtyp = pos
                 pos += b.size
             }
+            // A second top-level ftyp is an MP4 appended after the image container.
+            if (appendedFtyp >= 0 && validVideo(channel, appendedFtyp, size - appendedFtyp))
+                return MotionPhotoInfo(timestamp, size - appendedFtyp, appendedFtyp)
+            if (boxesReachEof && motion != "1") return null
+        } else if (motion == null && read(channel, size - 2, 2).contentEquals(byteArrayOf(-1, -39))) {
+            // A still JPEG that ends at EOI has nothing appended after the image.
+            return null
         }
-        if (motion == "1") {
-            // Overlap seven bytes so a split size+ftyp header cannot be missed.
-            val start = maxOf(0, size - 30L * 1024 * 1024)
-            var end = size
-            while (end > start) {
-                val begin = maxOf(start, end - 65536)
-                val bytes = read(channel, begin, (end - begin).toInt())
-                for (i in bytes.size - 8 downTo 0) {
-                    if (bytes[i + 4] == 102.toByte() && bytes[i + 5] == 116.toByte() &&
-                        bytes[i + 6] == 121.toByte() && bytes[i + 7] == 112.toByte()) {
-                        val offset = begin + i
-                        if (validVideo(channel, offset, size - offset)) return MotionPhotoInfo(timestamp, size - offset, offset)
-                    }
+        // Vendor motion photos may carry no Google XMP, or offsets that point at a proprietary
+        // envelope; scan for a structurally complete MP4 ending at EOF regardless of XMP claims.
+        // Overlap seven bytes so a split size+ftyp header cannot be missed.
+        val start = maxOf(0, size - 30L * 1024 * 1024)
+        var end = size
+        while (end > start) {
+            val begin = maxOf(start, end - 65536)
+            val bytes = read(channel, begin, (end - begin).toInt())
+            for (i in bytes.size - 8 downTo 0) {
+                if (bytes[i + 4] == 102.toByte() && bytes[i + 5] == 116.toByte() &&
+                    bytes[i + 6] == 121.toByte() && bytes[i + 7] == 112.toByte()) {
+                    val offset = begin + i
+                    if (validVideo(channel, offset, size - offset)) return MotionPhotoInfo(timestamp, size - offset, offset)
                 }
-                if (begin == start) break
-                end = begin + 7
             }
+            if (begin == start) break
+            end = begin + 7
         }
         return null
     }

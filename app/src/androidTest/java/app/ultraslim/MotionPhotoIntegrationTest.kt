@@ -30,9 +30,9 @@ class MotionPhotoIntegrationTest {
             input.writeBytes(jpeg + video)
             val detected = MotionPhotoHelper.detect(context, Uri.fromFile(input))!!
             assertEquals(info.copy(videoOffset = jpeg.size.toLong()), detected)
-            for (format in listOf(OutputFormat.JPEG, OutputFormat.HEIC)) {
+            for (format in listOf(OutputFormat.JPEG, OutputFormat.HEIC, OutputFormat.AVIF)) {
                 val output = File(dir, "output.${format.extension}")
-                val xmp = if (format == OutputFormat.HEIC) MotionPhotoContainer.xmp(detected, format.mimeType) else null
+                val xmp = if (format != OutputFormat.JPEG) MotionPhotoContainer.xmp(detected, format.mimeType) else null
                 ParcelFileDescriptor.open(input, ParcelFileDescriptor.MODE_READ_ONLY).use { a ->
                     ParcelFileDescriptor.open(output, ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE).use { b ->
                         val result = UltraHdrBridge.nativeTranscode(a.fd, b.fd, format.codecId, 90, 60, 4, true, true, true, 2, 100, 2, true, xmp)

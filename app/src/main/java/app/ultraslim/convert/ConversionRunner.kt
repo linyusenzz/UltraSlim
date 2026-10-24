@@ -163,7 +163,7 @@ internal class ConversionRunner(
                     }
                     val sourceDates = withContext(Dispatchers.IO) { SourceMedia.timestamps(app, source) }
                     val motionInfo = withContext(Dispatchers.IO) { MotionPhotoHelper.detect(app, source) }
-                    val motionXmp = if (motionInfo != null && options.format == OutputFormat.HEIC)
+                    val motionXmp = if (motionInfo != null && (options.format == OutputFormat.HEIC || options.format == OutputFormat.AVIF))
                         MotionPhotoContainer.xmp(motionInfo, options.format.mimeType) else null
 
                     val file = File(app.filesDir, "outputs/$id.${options.format.extension}").apply { parentFile?.mkdirs() }
@@ -191,7 +191,7 @@ internal class ConversionRunner(
                     if (!result.isSuccess) { file.delete(); error(result.error) }
                     var liveAttached = false
                     if (motionInfo != null) {
-                        if (options.format == OutputFormat.JPEG || options.format == OutputFormat.HEIC) {
+                        if (options.format == OutputFormat.JPEG || options.format == OutputFormat.HEIC || options.format == OutputFormat.AVIF) {
                             liveAttached = withContext(Dispatchers.IO) {
                                 MotionPhotoHelper.attachMotionPhoto(app, source, file, options.format, motionInfo)
                             }
