@@ -56,6 +56,9 @@ data class ConversionDefaults(
     val keepExif: Boolean = true,
     val allowSdr: Boolean = true,
     val autoSave: Boolean = true,
+    val outputTree: String = "",
+    val outputTreeLabel: String = "",
+    val retainSourceName: Boolean = false,
     val autoReplaceOriginals: Boolean = false,
     val onlySmaller: Boolean = true,
     val keepLocation: Boolean = true,
@@ -95,6 +98,9 @@ class SettingsRepository(private val context: Context) {
         val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
         val AUTO_REPLACE = booleanPreferencesKey("auto_replace_originals")
         val AUTO_SAVE = booleanPreferencesKey("auto_save")
+        val OUTPUT_TREE = stringPreferencesKey("export_tree")
+        val OUTPUT_TREE_LABEL = stringPreferencesKey("export_tree_label")
+        val RETAIN_NAME = booleanPreferencesKey("retain_source_name")
         val ONLY_SMALLER = booleanPreferencesKey("only_smaller")
         val KEEP_LOCATION = booleanPreferencesKey("keep_location")
         val SPEED_LEVEL = intPreferencesKey("speed_level")
@@ -113,6 +119,9 @@ class SettingsRepository(private val context: Context) {
             keepExif = p[Keys.KEEP_EXIF] ?: true,
             allowSdr = p[Keys.ALLOW_SDR] ?: true,
             autoSave = p[Keys.AUTO_SAVE] ?: true,
+            outputTree = p[Keys.OUTPUT_TREE].orEmpty(),
+            outputTreeLabel = p[Keys.OUTPUT_TREE_LABEL].orEmpty(),
+            retainSourceName = p[Keys.RETAIN_NAME] ?: false,
             autoReplaceOriginals = (p[Keys.AUTO_REPLACE] ?: false) && (p[Keys.AUTO_SAVE] ?: true),
             onlySmaller = p[Keys.ONLY_SMALLER] ?: true,
             keepLocation = p[Keys.KEEP_LOCATION] ?: true,
@@ -180,6 +189,14 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
+    suspend fun setOutputTree(uri: String, label: String) {
+        context.settingsStore().edit { it[Keys.OUTPUT_TREE] = uri; it[Keys.OUTPUT_TREE_LABEL] = label }
+    }
+
+    suspend fun setRetainSourceName(enabled: Boolean) {
+        context.settingsStore().edit { it[Keys.RETAIN_NAME] = enabled }
+    }
+
     suspend fun setOnlySmaller(value: Boolean) { context.settingsStore().edit { it[Keys.ONLY_SMALLER] = value } }
     suspend fun setKeepLocation(value: Boolean) { context.settingsStore().edit { it[Keys.KEEP_LOCATION] = value } }
 
@@ -209,6 +226,9 @@ class SettingsRepository(private val context: Context) {
             p[Keys.KEEP_EXIF] = d.keepExif
             p[Keys.ALLOW_SDR] = d.allowSdr
             p[Keys.AUTO_SAVE] = d.autoSave
+            p[Keys.OUTPUT_TREE] = d.outputTree
+            p[Keys.OUTPUT_TREE_LABEL] = d.outputTreeLabel
+            p[Keys.RETAIN_NAME] = d.retainSourceName
             p[Keys.AUTO_REPLACE] = d.autoReplaceOriginals && d.autoSave
             p[Keys.ONLY_SMALLER] = d.onlySmaller
             p[Keys.KEEP_LOCATION] = d.keepLocation
@@ -225,6 +245,7 @@ fun ConversionDefaults.encode(): String = org.json.JSONObject().apply {
     put("gainmapScale", gainmapScale); put("multiChannel", multiChannelGainmap); put("keepExif", keepExif)
     put("allowSdr", allowSdr); put("autoSave", autoSave); put("speed", speedLevel); put("resize", resizePercent)
     put("autoReplaceOriginals", autoReplaceOriginals && autoSave)
+    put("outputTree", outputTree); put("outputTreeLabel", outputTreeLabel); put("retainSourceName", retainSourceName)
     put("onlySmaller", onlySmaller); put("keepLocation", keepLocation)
     put("avifGainmapCompatibility", avifGainmapCompatibility)
     put("heicGainmapCompatibility", heicGainmapCompatibility)
@@ -240,6 +261,8 @@ fun decodeDefaults(value: String): ConversionDefaults {
         gainmapScale = j.optInt("gainmapScale", d.gainmapScale),
         multiChannelGainmap = j.optBoolean("multiChannel", d.multiChannelGainmap), keepExif = j.optBoolean("keepExif", d.keepExif),
         allowSdr = j.optBoolean("allowSdr", d.allowSdr), autoSave = j.optBoolean("autoSave", d.autoSave),
+        outputTree = j.optString("outputTree", ""), outputTreeLabel = j.optString("outputTreeLabel", ""),
+        retainSourceName = j.optBoolean("retainSourceName", false),
         autoReplaceOriginals = j.optBoolean("autoReplaceOriginals", false) && j.optBoolean("autoSave", true),
         speedLevel = j.optInt("speed", d.speedLevel), resizePercent = j.optInt("resize", d.resizePercent),
         onlySmaller = j.optBoolean("onlySmaller", d.onlySmaller), keepLocation = j.optBoolean("keepLocation", d.keepLocation),

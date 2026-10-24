@@ -139,6 +139,7 @@ object MediaStoreSaver {
             // Publishing may run the scanner, which can replace DATE_TAKEN when it cannot read
             // this output's EXIF. Reapply the known source date after publication, best effort.
             preserveCaptureTime(context, uri, dateTaken)
+            preserveFileTime(context, uri, fileModifiedTime)
             check(matches(resolver, uri, expected)) { "相册副本发布校验失败" }
             uri
         } catch (e: Exception) {
@@ -191,6 +192,15 @@ object MediaStoreSaver {
         if (timestamp == null || timestamp <= 0) return
         runCatching {
             context.contentResolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+                if (app.ultraslim.bridge.UltraHdrBridge.nativeUpdateFileTime(descriptor.fd, timestamp)) {
+                    // FAT and some providers round mtime to whole seconds (occasionally two).
+                    // A timestamp limitation must not discard an otherwise verified export.
+                    val stat = android.system.Os.fstat(descriptor.fileDescriptor)
+                    val actual = stat.st_mtime * 1000 + if (Build.VERSION.SDK_INT >= 27) stat.st_mtim.tv_nsec / 1_000_000 else 0
+                    if (kotlin.math.abs(actual - timestamp) > 2000)
+                        android.util.Log.w("MediaStoreSaver", "Provider did not retain requested file time")
+                    return@use
+                }
                 // Resolve the descriptor we own; opening /proc/self/fd directly for utime is denied by FUSE.
                 val path = android.system.Os.readlink("/proc/self/fd/${descriptor.fd}")
                 check(File(path).setLastModified(timestamp)) { "Provider declined timestamp update" }

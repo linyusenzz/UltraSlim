@@ -108,7 +108,8 @@ class DetailViewModel internal constructor(
             saving.value = true
             try {
                 val saved = OutputStore.save(app, entity)
-                _events.emit(DetailEvent.Message(if (saved.saveState == "SAVED") "已保存到相册/UltraSlim" else "保存失败，成品仍保留；可重试或导出文件"))
+                _events.emit(DetailEvent.Message(if (saved.saveState == "SAVED") "已保存到输出目录" else
+                    OutputStore.failureMessage(saved) ?: "保存失败，成品仍保留；请检查目录授权后重试或分享"))
             } catch (e: Exception) {
                 _events.emit(DetailEvent.Message("保存失败：${e.message}"))
             } finally {

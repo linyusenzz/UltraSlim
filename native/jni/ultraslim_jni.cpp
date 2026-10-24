@@ -2,6 +2,8 @@
 #include <jni.h>
 #include <exception>
 #include <algorithm>
+#include <sys/stat.h>
+#include <time.h>
 
 #include "transcode.h"
 
@@ -108,6 +110,17 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeTransco
     r.error = "JNI 未知异常";
     return toTranscodeResult(env, r);
   }
+}
+
+JNIEXPORT jboolean JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeUpdateFileTime(
+    JNIEnv*, jclass, jint fd, jlong milliseconds) {
+  struct stat info{};
+  if (fd < 0 || milliseconds <= 0 || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) return JNI_FALSE;
+  struct timespec times[2]{};
+  times[0].tv_nsec = UTIME_OMIT;
+  times[1].tv_sec = milliseconds / 1000;
+  times[1].tv_nsec = (milliseconds % 1000) * 1000000;
+  return futimens(fd, times) == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jstring JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeVersion(JNIEnv* env,

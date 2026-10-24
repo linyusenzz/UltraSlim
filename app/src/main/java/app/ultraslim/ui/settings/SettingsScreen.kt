@@ -5,6 +5,8 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,6 +42,15 @@ fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val chooseFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
+        if (tree != null) scope.launch {
+            try {
+                vm.selectOutputTree(tree)
+                snackbar.showSnackbar("输出目录已保存；之后开始的批次采用新目录")
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { snackbar.showSnackbar(e.message ?: "目录授权失败，请重新选择") }
+        }
+    }
     var showNotices by rememberSaveable { mutableStateOf(false) }
     if (showNotices) OpenSourceNoticesDialog { showNotices = false }
 
@@ -96,6 +107,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Icons.Rounded.VerifiedUser, defaults.autoReplaceOriginals,
                 { if (it) confirmAutoReplace = true else vm.setAutoReplaceOriginals(false) }, 2, 3,
                 enabled = Build.VERSION.SDK_INT >= 30)
+        }
+        SettingsGroup("输出文件", "之后开始的批次采用此设置；已有批次仍保存到原定目录") {
+            Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerLow) {
+                Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("输出目录", style = MaterialTheme.typography.titleMedium)
+                    Text(if (defaults.autoReplaceOriginals) "自动替换期间保存回原相册；关闭后恢复所选目录"
+                        else defaults.outputTreeLabel.ifBlank { "Pictures/UltraSlim" })
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(enabled = !defaults.autoReplaceOriginals, onClick = {
+                            chooseFolder.launch(defaults.outputTree.takeIf(String::isNotBlank)?.let(Uri::parse))
+                        }) { Text("选择文件夹") }
+                        if (defaults.outputTree.isNotBlank()) TextButton(enabled = !defaults.autoReplaceOriginals,
+                            onClick = { scope.launch { vm.selectOutputTree(null) } }) { Text("恢复默认相册") }
+                    }
+                    Text("尽量保留原修改时间；存储不支持时仍保存照片。目录授权失效时，成品留在应用内，可重新授权后重试。",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            SettingItem("保留源文件名", "仅更换扩展名；不支持的字符会替换，重名自动编号，不覆盖已有照片",
+                Icons.Rounded.Description, defaults.retainSourceName, vm::setRetainSourceName, 0, 1)
         }
         SettingsGroup("画面与兼容性") {
             val compatibleFormat = defaults.format == OutputFormat.AVIF || defaults.format == OutputFormat.HEIC

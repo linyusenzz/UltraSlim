@@ -1107,6 +1107,52 @@ uhdr_error_info_t JpegR::appendGainMap(uhdr_compressed_image_t* sdr_intent_compr
                                        uhdr_mem_block_t* pExif, void* pIcc, size_t icc_size,
                                        uhdr_gainmap_metadata_ext_t* metadata,
                                        uhdr_compressed_image_t* dest) {
+  // Re-muxing a compressed gain map must replace, rather than duplicate, its HDR
+  // metadata. In particular, never carry a rejected ISO block after XMP fallback.
+  // Keep all coding segments and scan bytes unchanged (no gain map recompression).
+  std::vector<uint8_t> clean_gainmap;
+  auto clean_descriptor = *gainmap_compressed;
+  const auto* source = static_cast<const uint8_t*>(gainmap_compressed->data);
+  const size_t source_size = gainmap_compressed->data_sz;
+  size_t map_marker = 2;
+  bool found_scan = false;
+  if (source_size >= 2 && source[0] == 0xff && source[1] == 0xd8) {
+    clean_gainmap.insert(clean_gainmap.end(), source, source + 2);
+    while (map_marker + 4 <= source_size && source[map_marker] == 0xff) {
+      size_t code = map_marker + 1;
+      while (code < source_size && source[code] == 0xff) ++code;
+      if (code >= source_size) break;
+      if (source[code] == 0xda) {
+        clean_gainmap.insert(clean_gainmap.end(), source + map_marker, source + source_size);
+        found_scan = true;
+        break;
+      }
+      if (code + 2 >= source_size) break;
+      const size_t length = (size_t(source[code + 1]) << 8) | source[code + 2];
+      if (length < 2 || length > source_size - code - 1) break;
+      const auto* payload = source + code + 3;
+      const size_t size = length - 2;
+      const bool old_xmp = kWriteXmpMetadata && source[code] == 0xe1 &&
+          size >= kXmpNameSpace.size() + 1 &&
+          memcmp(payload, kXmpNameSpace.c_str(), kXmpNameSpace.size() + 1) == 0;
+      const bool old_iso = kWriteIso21496_1Metadata && source[code] == 0xe2 &&
+          size >= kIsoNameSpace.size() + 1 &&
+          memcmp(payload, kIsoNameSpace.c_str(), kIsoNameSpace.size() + 1) == 0;
+      const size_t next = code + 1 + length;
+      if (!old_xmp && !old_iso) clean_gainmap.insert(clean_gainmap.end(), source + map_marker, source + next);
+      map_marker = next;
+    }
+  }
+  if (!found_scan) {
+    uhdr_error_info_t error = g_no_error;
+    error.error_code = UHDR_CODEC_ERROR; error.has_detail = 1;
+    snprintf(error.detail, sizeof error.detail, "invalid compressed gain map JPEG map_markers");
+    return error;
+  }
+  clean_descriptor.data = clean_gainmap.data();
+  clean_descriptor.data_sz = clean_descriptor.capacity = clean_gainmap.size();
+  gainmap_compressed = &clean_descriptor;
+
   if (kWriteXmpMetadata && !metadata->use_base_cg) {
     uhdr_error_info_t status;
     status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
@@ -1448,7 +1494,22 @@ uhdr_error_info_t UltraHdr::parseGainMapMetadata(uint8_t* iso_data, size_t iso_s
       iso_vec.push_back(iso_data[i]);
     }
 
-    UHDR_ERR_CHECK(uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso_vec, &decodedMetadata));
+    const auto iso_status = uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso_vec, &decodedMetadata);
+    // An unknown minimum version is not evidence that the independent Adobe XMP is bad.
+    // Do not hide corruption in a supported ISO layout (truncation, invalid fractions, etc.).
+    if (iso_status.error_code == UHDR_CODEC_UNSUPPORTED_FEATURE && iso_vec.size() >= 2 &&
+        (iso_vec[0] != 0 || iso_vec[1] != 0) && xmp_size > 0) {
+      uhdr_gainmap_metadata_ext_t fallback;
+      const auto xmp_status = getMetadataFromXMP(xmp_data, xmp_size, exif_data, exif_size,
+                                                &fallback, true);
+      if (xmp_status.error_code == UHDR_CODEC_OK) {
+        *uhdr_metadata = fallback;
+        ALOGW("Unsupported ISO minimum version; using validated Adobe gain map XMP");
+        return g_no_error;
+      }
+      return xmp_status;
+    }
+    UHDR_ERR_CHECK(iso_status);
     UHDR_ERR_CHECK(uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&decodedMetadata,
                                                                               uhdr_metadata));
   } else if (xmp_size > 0) {

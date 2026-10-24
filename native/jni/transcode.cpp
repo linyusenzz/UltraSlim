@@ -33,6 +33,7 @@
 #include <jxl/thread_parallel_runner.h>
 
 #include "ultrahdr/gainmapmetadata.h"
+#include "ultrahdr/jpegr.h"
 #include "ultrahdr/ultrahdrcommon.h"
 #include "ultrahdr_api.h"
 
@@ -2119,6 +2120,28 @@ int encodeJxl(const SdrImage& base, int quality, bool keepExif, int outFd,
 
 // ------------------------------------------------------------------- uhdr HDR
 
+// A declared but unreadable gain map must never be silently published as SDR.
+// Inspect metadata parsed from JPEG segments, not arbitrary strings in pixel data.
+bool jpegDeclaresHdr(BytesView data) {
+  auto declared = [](const void* xmp, size_t size, size_t isoSize) {
+    if (isoSize > 0) return true;
+    if (!xmp || !size) return false;
+    const std::string text(static_cast<const char*>(xmp), size);
+    return text.find("http://ns.adobe.com/hdr-gain-map/1.0/") != std::string::npos ||
+           text.find("HDRGainMapVersion") != std::string::npos;
+  };
+  ultrahdr::JpegDecoderHelper primary;
+  if (primary.parseImage(data.data(), data.size()).error_code == UHDR_CODEC_OK &&
+      declared(primary.getXMPPtr(), primary.getXMPSize(), primary.getIsoMetadataSize())) return true;
+  uhdr_compressed_image_t input{};
+  input.data = const_cast<uint8_t*>(data.data()); input.data_sz = input.capacity = data.size();
+  ultrahdr::jpeg_info_struct base{}, map{};
+  ultrahdr::jpegr_info_struct info{}; info.primaryImgInfo = &base; info.gainmapImgInfo = &map;
+  ultrahdr::JpegR parser;
+  return parser.getJPEGRInfo(&input, &info).error_code == UHDR_CODEC_OK &&
+         declared(map.xmpData.data(), map.xmpData.size(), map.isoData.size());
+}
+
 // Probes with the uhdr decoder; returns true when the image parses and carries a gain map.
 bool probeWithUhdr(BytesView data, ProbeResult* probe, TranscodeResult* tr,
                    DecoderPtr* outDecoder = nullptr) {
@@ -2131,13 +2154,25 @@ bool probeWithUhdr(BytesView data, ProbeResult* probe, TranscodeResult* tr,
   img.ct = UHDR_CT_UNSPECIFIED;
   img.range = UHDR_CR_UNSPECIFIED;
   if (uhdr_dec_set_image(dec.get(), &img).error_code != UHDR_CODEC_OK) return false;
-  if (uhdr_dec_probe(dec.get()).error_code != UHDR_CODEC_OK) return false;
+  const auto status = uhdr_dec_probe(dec.get());
+  if (status.error_code != UHDR_CODEC_OK) {
+    if (probe && sniffContainer(data.data(), data.size()) == 0 && jpegDeclaresHdr(data)) {
+      probe->errorCode = 4;
+      probe->error = describe(status, "HDR 增益图损坏或元数据不受支持，请保留原图");
+    }
+    return false;
+  }
   const int w = uhdr_dec_get_image_width(dec.get());
   const int h = uhdr_dec_get_image_height(dec.get());
   const int gw = uhdr_dec_get_gainmap_width(dec.get());
   const int gh = uhdr_dec_get_gainmap_height(dec.get());
   const bool hasGainMap = gw > 0 && gh > 0;
   if (!hasGainMap) return false;
+  if (w <= 0 || h <= 0 || static_cast<int64_t>(w) * h > kMaxPixels ||
+      static_cast<int64_t>(gw) * gh > kMaxPixels) {
+    if (probe) { probe->errorCode = 4; probe->error = "HDR 图像超过安全尺寸限制"; }
+    return false;
+  }
   if (probe != nullptr) {
     probe->width = w;
     probe->height = h;
@@ -2270,6 +2305,9 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
       constexpr size_t namespaceSize = sizeof("urn:iso:std:iso:ts:21496:-1");
       if (mapParser.getIsoMetadataSize() > namespaceSize)
         iso.assign(bytes + namespaceSize, bytes + mapParser.getIsoMetadataSize());
+      ultrahdr::uhdr_gainmap_metadata_frac parsed{};
+      if (ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso, &parsed).error_code != UHDR_CODEC_OK)
+        iso.clear(); // XMP fallback must not republish the rejected ISO block.
     }
     if (iso.empty()) iso = isoFromMetadata(*meta);
     // The derived HDR rendition must keep the source application gamut too.
@@ -2560,6 +2598,7 @@ ProbeResult probeViews(BytesView data, DecoderPtr* outDecoder = nullptr) {
     if (r.container != 0) { int w, h; probeHeifDims(data, w, h, r.hasExif); }
     return r;  // gain map image
   }
+  if (r.errorCode) return r;
   // SDR fallback: plain JPEG / HEIF / AVIF without a gain map
   bool ok = false;
   if (r.container == 0) {

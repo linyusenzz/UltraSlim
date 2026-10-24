@@ -84,7 +84,14 @@ class UltraSlimApp : Application() {
                 entity
             }
             val referenced = buildSet {
-                allRows.forEach { add(it.inputUri); add(it.outputUri) }
+                allRows.forEach {
+                    add(it.inputUri); add(it.outputUri)
+                    if (!it.outputUri.startsWith("content://")) {
+                        add(it.outputUri + ".export.json")
+                        add(it.outputUri + ".export.json.bak")
+                        add(it.outputUri + ".export.json.new")
+                    }
+                }
                 conversionRepository.queue.value.forEach { add(it.uri); it.outputUri?.let(::add) }
             }
             val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000

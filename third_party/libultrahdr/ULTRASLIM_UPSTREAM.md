@@ -37,6 +37,18 @@ fixtures/docs are present locally but not tracked due to the vendored .gitignore
 these were not counted as matched tracked files. Raw audit details are in
 `build/validation-dependencies/libultrahdr/` (ignored).
 
+## Local JPEG metadata compatibility (2026-10-24)
+
+`jpegr.cpp` now permits an unsupported ISO minimum version to fall back to a
+strictly validated scalar Adobe XMP packet from the gain-map JPEG. Valid ISO
+retains priority; corruption in a supported ISO layout is not ignored. The strict
+mode in `jpegrutils.cpp` / `jpegrutils.h` checks namespace, version, duplicate
+attributes, complete numeric tokens and finite, ordered gain-map parameters.
+JPEG remuxing removes replaced gain-map metadata blocks while retaining coding
+segments and scan bytes. This is a local compatibility change, not an upstream
+version upgrade. `native/host_test/jpeg_metadata_fallback.cpp` covers selection,
+rejection, remuxing and decoded gain-map pixel preservation.
+
 ## Release versus main
 
 v2.0.2 was the latest published release at audit time. Upstream main was

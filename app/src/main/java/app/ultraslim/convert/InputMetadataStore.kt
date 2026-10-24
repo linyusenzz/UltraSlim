@@ -15,7 +15,6 @@ internal object InputMetadataStore {
     private fun file(context: Context, id: String) = File(directory(context), "$id.json")
 
     fun write(context: Context, id: String, timestamps: SourceTimestamps) {
-        if (timestamps.dateTaken == null && timestamps.modifiedAt == null) return
         val atomic = AtomicFile(file(context, id))
         var stream: java.io.FileOutputStream? = null
         try {
@@ -39,7 +38,7 @@ internal object InputMetadataStore {
         return runCatching {
             val json = JSONObject(String(AtomicFile(file(context, id)).readFully(), Charsets.UTF_8))
             SourceTimestamps(json.optLong("dateTaken").takeIf { it > 0 },
-                json.optLong("modifiedAt").takeIf { it > 0 }).takeIf { it.dateTaken != null || it.modifiedAt != null }
+                json.optLong("modifiedAt").takeIf { it > 0 })
         }.getOrNull()
     }
 

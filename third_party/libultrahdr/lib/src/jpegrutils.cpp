@@ -108,7 +108,7 @@ uhdr_error_info_t Write(uhdr_compressed_image_t* destination, const void* source
 // Extremely simple XML Handler - just searches for interesting elements
 class XMPXmlHandler : public XmlHandler {
  public:
-  XMPXmlHandler() : XmlHandler() {
+  explicit XMPXmlHandler(bool strict_mode = false) : XmlHandler(), strict(strict_mode) {
     state = NotStrarted;
     versionFound = false;
     minContentBoostFound = false;
@@ -128,8 +128,11 @@ class XMPXmlHandler : public XmlHandler {
     string val;
     if (context.BuildTokenValue(&val)) {
       if (!val.compare(containerName)) {
+        if (strict && ++descriptions != 1) invalidStrict = true;
         state = Started;
       } else if (state == Started) {
+        // Fallback only accepts the scalar Adobe representation we can fully parse.
+        if (strict) invalidStrict = true;
         if (val.find(kAppleMapVersion) != string::npos) {
           lastElementName = kAppleMapVersion;
         } else if (val.find(kAppleMapHeadroom) != string::npos) {
@@ -179,7 +182,13 @@ class XMPXmlHandler : public XmlHandler {
     string val;
     if (state == Started) {
       if (context.BuildTokenValue(&val)) {
-        if (!val.compare(versionAttrName)) {
+        if (strict) {
+          if (std::find(attributes.begin(), attributes.end(), val) != attributes.end()) invalidStrict = true;
+          attributes.push_back(val);
+        }
+        if (strict && val == "xmlns:hdrgm") {
+          lastAttributeName = val;
+        } else if (!val.compare(versionAttrName)) {
           lastAttributeName = versionAttrName;
         } else if (!val.compare(maxContentBoostAttrName)) {
           lastAttributeName = maxContentBoostAttrName;
@@ -209,7 +218,9 @@ class XMPXmlHandler : public XmlHandler {
     string val;
     if (state == Started) {
       if (context.BuildTokenValue(&val, true)) {
-        if (!lastAttributeName.compare(versionAttrName)) {
+        if (strict && lastAttributeName == "xmlns:hdrgm") {
+          adobeNamespace = val == "http://ns.adobe.com/hdr-gain-map/1.0/";
+        } else if (!lastAttributeName.compare(versionAttrName)) {
           versionStr = val;
           versionFound = true;
         } else if (!lastAttributeName.compare(maxContentBoostAttrName)) {
@@ -257,7 +268,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = maxContentBoostFound;
       stringstream ss(maxContentBoostStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *max_content_boost = exp2(val);
         return true;
       } else {
@@ -273,7 +284,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = minContentBoostFound;
       stringstream ss(minContentBoostStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *min_content_boost = exp2(val);
         return true;
       } else {
@@ -289,7 +300,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = gammaFound;
       stringstream ss(gammaStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *gamma = val;
         return true;
       } else {
@@ -305,7 +316,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = offsetSdrFound;
       stringstream ss(offsetSdrStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *offset_sdr = val;
         return true;
       } else {
@@ -321,7 +332,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = offsetHdrFound;
       stringstream ss(offsetHdrStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *offset_hdr = val;
         return true;
       } else {
@@ -337,7 +348,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = hdrCapacityMinFound;
       stringstream ss(hdrCapacityMinStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *hdr_capacity_min = exp2(val);
         return true;
       } else {
@@ -353,7 +364,7 @@ class XMPXmlHandler : public XmlHandler {
       *present = hdrCapacityMaxFound;
       stringstream ss(hdrCapacityMaxStr);
       float val;
-      if (ss >> val) {
+      if ((ss >> val) && (!strict || (ss >> std::ws).eof())) {
         *hdr_capacity_max = exp2(val);
         return true;
       } else {
@@ -382,8 +393,15 @@ class XMPXmlHandler : public XmlHandler {
   }
 
   bool getIsApple() const { return isApple; }
+  bool validStrictAdobe() const {
+    return !invalidStrict && descriptions == 1 && adobeNamespace && !isApple &&
+           versionFound && versionStr == "1.0";
+  }
 
  private:
+  bool strict = false, invalidStrict = false, adobeNamespace = false;
+  int descriptions = 0;
+  std::vector<string> attributes;
   static const string containerName;
 
   static const string versionAttrName;
@@ -644,7 +662,8 @@ static bool getExifAppleHeadroom(const uint8_t* exif, size_t size, float* altHea
 }
 
 uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t* exif_data,
-                                     int exif_size, uhdr_gainmap_metadata_ext_t* metadata) {
+                                     int exif_size, uhdr_gainmap_metadata_ext_t* metadata,
+                                     bool strict_adobe) {
   string nameSpace = "http://ns.adobe.com/xap/1.0/\0";
 
   if (xmp_size < nameSpace.size() + 2) {
@@ -657,7 +676,8 @@ uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t
     return status;
   }
 
-  if (strncmp(reinterpret_cast<char*>(xmp_data), nameSpace.c_str(), nameSpace.size())) {
+  if (strncmp(reinterpret_cast<char*>(xmp_data), nameSpace.c_str(), nameSpace.size()) ||
+      (strict_adobe && xmp_data[nameSpace.size()] != 0)) {
     uhdr_error_info_t status;
     status.error_code = UHDR_CODEC_ERROR;
     status.has_detail = 1;
@@ -670,7 +690,7 @@ uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t
   // Position the pointers to the start of XMP XML portion
   xmp_data += nameSpace.size() + 1;
   xmp_size -= nameSpace.size() + 1;
-  XMPXmlHandler handler;
+  XMPXmlHandler handler(strict_adobe);
 
   // xml parser fails to parse packet header, wrapper. remove them before handing the data to
   // parser. if there is no packet header, do nothing otherwise go to the position of '<' without
@@ -712,11 +732,11 @@ uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t
   reader.StartParse(std::move(rule));
   reader.Parse(str);
   reader.FinishParse();
-  if (reader.HasErrors()) {
+  if (reader.HasErrors() || (strict_adobe && !handler.validStrictAdobe())) {
     uhdr_error_info_t status;
     status.error_code = UHDR_CODEC_UNKNOWN_ERROR;
     status.has_detail = 1;
-    snprintf(status.detail, sizeof status.detail, "xml parser returned with error");
+    snprintf(status.detail, sizeof status.detail, "invalid or unsupported gain map XMP");
     return status;
   }
 
@@ -873,6 +893,7 @@ uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t
   std::fill_n(metadata->offset_hdr + 1, 2, metadata->offset_hdr[0]);
   std::fill_n(metadata->offset_sdr + 1, 2, metadata->offset_sdr[0]);
 
+  if (strict_adobe) return uhdr_validate_gainmap_metadata_descriptor(metadata);
   return g_no_error;
 }
 

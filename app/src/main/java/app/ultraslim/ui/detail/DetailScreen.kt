@@ -455,7 +455,7 @@ private fun DetailContent(
                         tint = if (entity.saveState == "FAILED") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                     )
                     Text(
-                        if (entity.saveState == "FAILED") "保存到相册失败；成品已在应用内保留，可点击底部重试或分享。" else "成品已在应用沙盒内保留，可点击下方按钮保存到系统相册。",
+                        if (entity.saveState == "FAILED") "保存到输出目录失败；成品仍保留，可重新授权原目录后重试或分享。" else "成品已在应用内保留，可点击下方按钮保存到此批次的输出目录。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

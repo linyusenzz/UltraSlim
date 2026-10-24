@@ -84,7 +84,8 @@ uhdr_error_info_t Write(uhdr_compressed_image_t* destination, const void* source
  * @return success or error code.
  */
 uhdr_error_info_t getMetadataFromXMP(uint8_t* xmp_data, size_t xmp_size, uint8_t* exif_data,
-                                     int exif_size, uhdr_gainmap_metadata_ext_t* metadata);
+                                     int exif_size, uhdr_gainmap_metadata_ext_t* metadata,
+                                     bool strict_adobe = false);
 
 /*
  * This method generates XMP metadata for the primary image.

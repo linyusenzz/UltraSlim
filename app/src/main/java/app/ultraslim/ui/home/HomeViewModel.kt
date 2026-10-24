@@ -217,9 +217,11 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             }
             runDefaults.value = if (unfinished && snapshot?.isValid == true) requireNotNull(snapshot.options)
                 else settings.defaults.first()
-            settings.defaults.map { it.autoReplaceOriginals }.distinctUntilChanged().collect { enabled ->
-                runDefaults.value = runDefaults.value.copy(autoReplaceOriginals = enabled,
-                    autoSave = if (enabled) true else runDefaults.value.autoSave)
+            settings.defaults.collect { saved ->
+                runDefaults.value = runDefaults.value.copy(autoReplaceOriginals = saved.autoReplaceOriginals,
+                    autoSave = if (saved.autoReplaceOriginals) true else runDefaults.value.autoSave,
+                    outputTree = saved.outputTree, outputTreeLabel = saved.outputTreeLabel,
+                    retainSourceName = saved.retainSourceName)
             }
         }
         // 批次中只补新增原图；实际发起回收前仍由 refreshAndGetTrashable 全量校验。

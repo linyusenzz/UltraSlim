@@ -3,6 +3,7 @@ package app.ultraslim.ui.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.ultraslim.UltraSlimApp
+import app.ultraslim.convert.SelectedOutput
 import app.ultraslim.data.ConversionDefaults
 import app.ultraslim.data.ThemeMode
 import app.ultraslim.data.ThemeSettings
@@ -42,6 +43,15 @@ class SettingsViewModel(private val app: UltraSlimApp) : ViewModel() {
     fun setAllowSdr(allow: Boolean) = viewModelScope.launch { repo.setAllowSdr(allow) }
 
     fun setAutoSave(enabled: Boolean) = viewModelScope.launch { repo.setAutoSave(enabled) }
+
+    fun setRetainSourceName(enabled: Boolean) = viewModelScope.launch { repo.setRetainSourceName(enabled) }
+
+    suspend fun selectOutputTree(uri: android.net.Uri?) {
+        val label = if (uri == null) "" else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            SelectedOutput.authorize(app, uri)
+        }
+        repo.setOutputTree(uri?.toString().orEmpty(), label)
+    }
 
     fun setAutoReplaceOriginals(v: Boolean) = viewModelScope.launch { repo.setAutoReplaceOriginals(v) }
 

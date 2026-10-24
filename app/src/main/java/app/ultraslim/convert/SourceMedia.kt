@@ -58,11 +58,17 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
                 modified = queryTime(context, source, android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED)
             }
             if (taken == null) taken = exifCaptureTime(context, source)
-            val fileTime = modified ?: runCatching {
+            val descriptorTime = runCatching {
                 context.contentResolver.openFileDescriptor(source, "r")?.use {
-                    android.system.Os.fstat(it.fileDescriptor).st_mtime.takeIf { seconds -> seconds > 0 && seconds <= Long.MAX_VALUE / 1000 }?.times(1000)
+                    val stat = android.system.Os.fstat(it.fileDescriptor)
+                    if (!android.system.OsConstants.S_ISREG(stat.st_mode)) return@use null
+                    val seconds = stat.st_mtime.takeIf { value -> value > 0 && value <= Long.MAX_VALUE / 1000 } ?: return@use null
+                    seconds * 1000 + if (Build.VERSION.SDK_INT >= 27) stat.st_mtim.tv_nsec / 1_000_000 else 0
                 }
             }.getOrNull()
+            // Cloud providers may return a temporary download fd; their indexed date wins.
+            val local = source.authority == "media" || source.authority == "com.android.externalstorage.documents"
+            val fileTime = if (local) descriptorTime ?: modified else modified ?: descriptorTime
             // DATE_ADDED and file modification time are not capture time.
             return SourceTimestamps(taken, fileTime)
         }

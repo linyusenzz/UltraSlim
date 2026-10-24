@@ -92,6 +92,10 @@ object UltraHdrBridge {
     @JvmStatic
     external fun nativeVersion(): String
 
+    /** Best effort on an already granted output descriptor; no path traversal or permission changes. */
+    @JvmStatic
+    external fun nativeUpdateFileTime(fd: Int, milliseconds: Long): Boolean
+
     /**
      * Decodes the primary SDR rendition of an image to a small JPEG, for previews
      * the platform decoder cannot handle (e.g. ISO 21496-1 gain map HEIC).

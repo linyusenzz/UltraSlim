@@ -2,6 +2,7 @@ package app.ultraslim.convert
 
 import app.ultraslim.model.OutputFormat
 import app.ultraslim.util.outputName
+import app.ultraslim.util.ExportNames
 import android.Manifest
 import android.app.PendingIntent
 import android.app.ActivityManager
@@ -160,6 +161,7 @@ internal class ConversionRunner(
                     if (!probe.hasGainMap && !options.allowSdr) {
                         repo.update(id) { it.copy(status = QueueStatus.SKIPPED, error = "按设置跳过 SDR 图片") }; continue
                     }
+                    val sourceDates = withContext(Dispatchers.IO) { SourceMedia.timestamps(app, source) }
                     val motionInfo = withContext(Dispatchers.IO) { MotionPhotoHelper.detect(app, source) }
                     val motionXmp = if (motionInfo != null && options.format == OutputFormat.HEIC)
                         MotionPhotoContainer.xmp(motionInfo, options.format.mimeType) else null
@@ -214,7 +216,10 @@ internal class ConversionRunner(
                     } else if (!result.hasGainMap) {
                         withContext(Dispatchers.IO) { SdrOutputValidation.requireReadable(file, options.format) }
                     }
-                    val name = outputName(item.displayName, options.format.extension, id, item.createdAt, motionPhoto = liveAttached)
+                    val name = if (options.retainSourceName)
+                        ExportNames.fromSource(item.displayName, options.format.extension)
+                    else outputName(item.displayName, options.format.extension, id, item.createdAt, motionPhoto = liveAttached)
+                    withContext(Dispatchers.IO) { ExportCheckpoint(file).capture(sourceDates) }
                     val liveSummary = if (motionInfo != null) {
                         if (liveAttached) " · 实况已保留(无损直通)" else " · 原图实况(导出静止HDR)"
                     } else ""
