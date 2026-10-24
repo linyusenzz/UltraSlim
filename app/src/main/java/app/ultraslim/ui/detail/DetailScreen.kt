@@ -92,7 +92,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -499,7 +498,7 @@ private fun DetailContent(
 private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier) {
     var compareMode by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) } // 0: 卷帘, 1: 按住
     var isHoldingOriginal by remember { mutableStateOf(false) }
-    var fraction by androidx.compose.runtime.saveable.rememberSaveable { mutableFloatStateOf(0.5f) }
+    val sliderState = rememberSliderState(value = 0.5f)
     var viewSize by remember { mutableStateOf(IntSize(1, 1)) }
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
@@ -527,12 +526,6 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
         (scaleNow - 1f) * viewSize.width / 2f,
         (scaleNow - 1f) * viewSize.height / 2f,
     )
-
-    val effectiveFraction = if (compareMode == 1) {
-        if (isHoldingOriginal) 1f else 0f
-    } else {
-        fraction
-    }
 
     val previewHeight = with(density) { (LocalWindowInfo.current.containerSize.height.toDp() * .4f).coerceIn(220.dp, 420.dp) }
     val transform = rememberTransformableState { zoom, pan, _ ->
@@ -590,7 +583,7 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                     if (!zoomedIn && compareMode == 0) {
                         detectHorizontalDragGestures { change, dragAmount ->
                             change.consume()
-                            fraction = (fraction + dragAmount / viewSize.width).coerceIn(0f, 1f)
+                            sliderState.value = (sliderState.value + dragAmount / viewSize.width).coerceIn(0f, 1f)
                         }
                     }
                 }
@@ -621,6 +614,11 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                 forceSdr = true,
                 maxDim = if(highResZoom) 2048 else if(outputLong in 1 until 1600) outputLong else 1600,
                 modifier = Modifier.fillMaxSize().drawWithContent {
+                    val effectiveFraction = if (compareMode == 1) {
+                        if (isHoldingOriginal) 1f else 0f
+                    } else {
+                        sliderState.value
+                    }
                     clipRect(right = size.width * effectiveFraction) { this@drawWithContent.drawContent() }
                 },
             )
@@ -630,7 +628,7 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                 Box(
                     modifier = Modifier
                         .align(Alignment.CenterStart)
-                        .offset { androidx.compose.ui.unit.IntOffset((viewSize.width * fraction - with(density) { 1.dp.toPx() }).toInt(), 0) }
+                        .offset { androidx.compose.ui.unit.IntOffset((viewSize.width * sliderState.value - with(density) { 1.dp.toPx() }).toInt(), 0) }
                         .width(2.dp)
                         .fillMaxHeight()
                         .background(Color.White.copy(alpha = 0.9f)),
@@ -643,7 +641,7 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                     shadowElevation = 4.dp,
                     modifier = Modifier
                         .align(Alignment.CenterStart)
-                        .offset { androidx.compose.ui.unit.IntOffset((viewSize.width * fraction - with(density) { 18.dp.toPx() }).toInt(), 0) }
+                        .offset { androidx.compose.ui.unit.IntOffset((viewSize.width * sliderState.value - with(density) { 18.dp.toPx() }).toInt(), 0) }
                         .size(36.dp),
                 ) {
                     Icon(
@@ -698,12 +696,10 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
         }
 
         if (compareMode == 0) {
-            val sliderState = rememberSliderState(value = fraction)
-            SideEffect { sliderState.value = fraction }
             Slider(
                 modifier = Modifier.padding(horizontal = 16.dp).semantics { contentDescription = "原图与成品比较比例" },
                 state = sliderState,
-                onValueChange = { fraction = it },
+                onValueChange = { sliderState.value = it },
             )
         } else {
             Row(

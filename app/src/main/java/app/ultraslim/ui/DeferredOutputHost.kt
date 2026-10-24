@@ -5,7 +5,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.work.WorkManager
 import app.ultraslim.UltraSlimApp
-import app.ultraslim.convert.AutoReplacement
 import app.ultraslim.convert.ConversionWorker
 import app.ultraslim.convert.OutputStore
 import app.ultraslim.data.decodeDefaults
@@ -43,11 +42,7 @@ internal fun DeferredOutputHost() {
                             // Recheck after the suspend batch lookup, immediately before saving.
                             if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
                             try {
-                                val saved = OutputStore.save(app, row)
-                                if (options.autoReplaceOriginals) AutoReplacement.saved(app, saved)
-                                row.taskId?.let { id -> app.conversionRepository.update(id) {
-                                    it.copy(outputUri = saved.outputUri, error = if (saved.saveState == "SAVED") null else "保存失败，可在详情重试")
-                                } }
+                                OutputStore.save(app, row)
                             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                             catch (e: Exception) {
                                 // A deleted history row or lost provider must not crash the foreground app.

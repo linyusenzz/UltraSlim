@@ -247,8 +247,12 @@ internal object MotionPhotoContainer {
         val marker = ByteBuffer.allocate(packet.size + 4).put(0xff.toByte()).put(0xe1.toByte()).putShort((packet.size + 2).toShort()).put(packet).array()
         val start = old?.start ?: 2
         val end = old?.end ?: start
+        val markerEnd = Math.addExact(start, marker.size)
+        val result = ByteArray(Math.addExact(markerEnd, bytes.size - end))
+        bytes.copyInto(result, endIndex = start)
+        marker.copyInto(result, destinationOffset = start)
+        bytes.copyInto(result, destinationOffset = markerEnd, startIndex = end)
         val delta = marker.size - (end - start)
-        val result = bytes.copyOfRange(0, start) + marker + bytes.copyOfRange(end, bytes.size)
         fun shifted(pos: Int) = if (pos >= end) pos + delta else pos
         val original = ByteBuffer.wrap(bytes).order(order)
         val updated = ByteBuffer.wrap(result).order(order)

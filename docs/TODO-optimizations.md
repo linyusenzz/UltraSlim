@@ -1,6 +1,16 @@
 # 优化待办
 
-来源：2026-10-13 全项目优化审计；2026-10-17 第二批次已按实测数据收敛。
+来源：2026-10-13 全项目优化审计；2026-10-17 第二批次已按实测数据收敛；2026-10-24 修复第三轮审查问题。
+
+## 已完成（2026-10-24 批次）
+
+- **JXL 正确性与边界**：probe/preserve 共用有界 `jhgm` 解析，修复 ISO 末尾一字节越界；损坏 gain map 不再回退 SDR。JXL 不再叠加 EXIF 方向；`scaledSize` 使用 64 位中间值。JPEG mem destination 错误路径先同步当前指针再清理，保留成功路径原实现。
+- **透明输入不再静默丢通道**：HEIF/AVIF/JXL 主图含 alpha 时，SDR/HDR preserve 返回 errorCode 33 且输出为空，预览仍可用。host 覆盖透明 JXL/HEIC、截断 `jhgm`、JXL codestream+EXIF 方向组合、极端尺寸及 gain map 自身带 alpha 的误拒检查。
+- **保存与回收一致性**：`OutputStore.save` 默认统一更新替换日志和队列，Runner 专用 checkpoint 避免双写；保存完成后收尾不可取消。历史回收缓存按 `(id,inputUri)` 隔离并防旧异步结果回写，回收前重查当前行；重新关联不再在主线程重复做 Provider I/O。
+- **Room v7**：显式回填旧任务 `result_hasGainMap/hasExif/maxContentBoost`，保留空结果和已有值；v3/v6 真实旧 schema 数据用例覆盖读取结果，修正“NULL 自动回退 Kotlin 默认值”的错误约束。
+- **内存与批量 UI**：JPEG 实况 XMP 合并改为一次精确分配；自动替换结果回调改为分块 Room + 批量 MediaStore 查询；卷帘比例使用单一 `SliderState`，避免根组合逐帧读取。
+- **构建与门禁**：Python `assert` 校验改为显式失败；依赖外层/内层构建并发可配置且受限；Android JNI 往返加入 JXL；标准 `verify.sh` 纳入 5 张截图。修复截图引擎 `PreviewScreenshotTestEngineInput.*` 路径配置，检查并更新 4 张既有自动保存文案基线。
+- **验证**：`scripts/verify.sh` 连续三次全量通过（原生 5 项 CTest、JVM 单测、5 张截图、Debug/Release、Debug/Release lint、真实 APK 16KB 对齐）。ASan/UBSan `preview_probe` 通过；macOS 不支持 `detect_leaks`，未计泄漏检测。设备测试包已编译；本机无连接设备，未执行设备端迁移、回收、自动替换或 JXL JNI 测试。
 
 ## 已完成（2026-10-17 批次）
 
@@ -81,6 +91,12 @@
 3. **#21 PreviewCache LruCache 逐出不 recycle**：native heap 靠 GC，通常可接受。
 4. **coil 后续 minor 升级**：沿用本次模式（只用到 AsyncImage/ImageRequest/crossfade 稳定 API，
    升级后仍需真机过一遍列表/详情图片加载）。
+8. **完整 alpha 编码支持**：当前仅做到透明输入明确拒绝。需实现 HEIF alpha 平面、JXL alpha extra channel，
+   并补透明 AVIF、透明 HDR HEIF/AVIF 的独立端到端固件与平台验证。
+9. **JPEG 扩容后错误故障注入**：错误清理已修正，但 malloc 失败路径尚未由专门故障用例触发；
+   后续用 ASan/分配故障注入验证双重释放与泄漏，不改动正常成功路径。
+10. **设备端验收**：在专用 Android 设备执行 v3/v6 迁移、手动保存、重新关联回收、自动替换、
+    JXL JNI 与 Adaptive/手势回归；本批仅完成设备测试包编译。
 
 ## 已确认不再需要
 

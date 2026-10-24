@@ -11,6 +11,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NATIVE_DIR="$(dirname "$SCRIPT_DIR")"
 MODE="${1:?usage: build_deps.sh host|android <abi> <ndk_path> [api]}"
 
+# Bound this superbuild's outer projects and their direct build-tool jobs.
+TOTAL_JOBS="${ULTRASLIM_DEPS_TOTAL_JOBS-4}"
+PROJECT_JOBS="${ULTRASLIM_DEPS_PROJECT_JOBS-2}"
+validate_positive_integer() {
+  case "$2" in
+    ''|*[!0-9]*|0*)
+      echo "$1 must be a positive integer (got: $2)" >&2
+      exit 2
+      ;;
+  esac
+}
+validate_positive_integer ULTRASLIM_DEPS_TOTAL_JOBS "$TOTAL_JOBS"
+validate_positive_integer ULTRASLIM_DEPS_PROJECT_JOBS "$PROJECT_JOBS"
+if [ "$PROJECT_JOBS" -gt "$TOTAL_JOBS" ]; then
+  PROJECT_JOBS="$TOTAL_JOBS"
+fi
+INNER_JOBS=$((TOTAL_JOBS / PROJECT_JOBS))
+
 if [ "$MODE" = "host" ]; then
   FLAVOR="host"
   EXTRA_ARGS=()
@@ -59,9 +77,10 @@ fi
 cmake -G Ninja -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
   -DDEPS_PREFIX="$PREFIX" \
+  -DDEPS_INNER_JOBS="$INNER_JOBS" \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
-cmake --build "$BUILD_DIR" --parallel
+cmake --build "$BUILD_DIR" --parallel "$PROJECT_JOBS"
 
 echo "==> deps installed to $PREFIX"
 ls "$PREFIX/lib"

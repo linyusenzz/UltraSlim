@@ -21,44 +21,64 @@ object OutputStore {
         app: UltraSlimApp,
         record: HistoryEntity,
         expectedFingerprint: MediaStoreSaver.Fingerprint? = null,
-    ): HistoryEntity = saveLock.withLock {
-        val current = app.database.historyDao().byId(record.id) ?: error("记录已删除")
-        if (current.outputUri.startsWith("content://")) return@withLock current
-        val replacement = app.database.replacementDao().byId(current.id)?.takeIf { it.state == "PREPARED" }
-        val source = Uri.parse(replacement?.sourceUri ?: current.inputUri)
-        val metadata = withContext(Dispatchers.IO) { SourceMedia.read(app, source) }
-        // 私有成品只读一次：调用方（如自动替换 stage）已算过指纹时直接复用；
-        // 发布后的相册副本在 MediaStoreSaver.save 内部已完成整读 SHA-256 校验。
-        val expected = expectedFingerprint ?: withContext(Dispatchers.IO) {
-            MediaStoreSaver.fingerprintOf(File(current.outputUri))
-        }
-        val uri = try { withContext(Dispatchers.IO) {
-            val file = File(current.outputUri)
-            val format = OutputFormat.parse(current.format)
-            val task = current.taskId ?: "history-${current.id}"
-            val timestamps = metadata?.let { SourceTimestamps(it.dateTaken, it.modifiedAt) }
-                ?: SourceMedia.timestamps(app, source)
-            val sameAlbum = if (replacement != null && metadata != null) MediaStoreSaver.save(app, file,
-                current.displayName, format, taskId = task, relativePath = metadata.relativePath,
-                volume = metadata.volume, dateTaken = timestamps.dateTaken, relatedUri = source,
-                fileModifiedTime = timestamps.modifiedAt ?: timestamps.dateTaken,
-                expectedFingerprint = expected) else null
-            if (sameAlbum != null) sameAlbum else {
-                if (replacement != null) AutoReplacement.finish(app, listOf(replacement), "SKIPPED",
-                    "无法保存回原相册，成品保存到 UltraSlim，原图保留")
-                MediaStoreSaver.save(app, file, current.displayName, format, taskId = task, dateTaken = timestamps.dateTaken,
-                    fileModifiedTime = timestamps.modifiedAt ?: timestamps.dateTaken,
-                    expectedFingerprint = expected)
+        finalizePublication: Boolean = true,
+    ): HistoryEntity {
+        val saved = saveLock.withLock {
+            val current = app.database.historyDao().byId(record.id) ?: error("记录已删除")
+            if (current.outputUri.startsWith("content://")) return@withLock current
+            val replacement = app.database.replacementDao().byId(current.id)?.takeIf { it.state == "PREPARED" }
+            val source = Uri.parse(replacement?.sourceUri ?: current.inputUri)
+            val metadata = withContext(Dispatchers.IO) { SourceMedia.read(app, source) }
+            // 私有成品只读一次：调用方（如自动替换 stage）已算过指纹时直接复用；
+            // 发布后的相册副本在 MediaStoreSaver.save 内部已完成整读 SHA-256 校验。
+            val expected = expectedFingerprint ?: withContext(Dispatchers.IO) {
+                MediaStoreSaver.fingerprintOf(File(current.outputUri))
             }
-        } } catch(e: kotlinx.coroutines.CancellationException) { throw e } catch(e: Exception) { null }
-        // finish() may have added a replacement outcome while saving.
-        // MediaStoreSaver.save only returns a non-null URI after matches(resolver, uri, expected) succeeds.
-        val verified = uri?.takeIf { expected != null && expected.bytes > 0 }
-        val latest = app.database.historyDao().byId(current.id) ?: current
-        val updated = if (verified != null) latest.copy(outputUri = verified.toString(), saveState = "SAVED") else latest.copy(saveState = "FAILED")
-        app.database.historyDao().update(updated)
-        if (verified != null) withContext(Dispatchers.IO) { File(current.outputUri).delete() }
-        updated
+            val uri = try { withContext(Dispatchers.IO) {
+                val file = File(current.outputUri)
+                val format = OutputFormat.parse(current.format)
+                val task = current.taskId ?: "history-${current.id}"
+                val timestamps = metadata?.let { SourceTimestamps(it.dateTaken, it.modifiedAt) }
+                    ?: SourceMedia.timestamps(app, source)
+                val sameAlbum = if (replacement != null && metadata != null) MediaStoreSaver.save(app, file,
+                    current.displayName, format, taskId = task, relativePath = metadata.relativePath,
+                    volume = metadata.volume, dateTaken = timestamps.dateTaken, relatedUri = source,
+                    fileModifiedTime = timestamps.modifiedAt ?: timestamps.dateTaken,
+                    expectedFingerprint = expected) else null
+                if (sameAlbum != null) sameAlbum else {
+                    if (replacement != null) AutoReplacement.finish(app, listOf(replacement), "SKIPPED",
+                        "无法保存回原相册，成品保存到 UltraSlim，原图保留")
+                    MediaStoreSaver.save(app, file, current.displayName, format, taskId = task, dateTaken = timestamps.dateTaken,
+                        fileModifiedTime = timestamps.modifiedAt ?: timestamps.dateTaken,
+                        expectedFingerprint = expected)
+                }
+            } } catch(e: kotlinx.coroutines.CancellationException) { throw e } catch(e: Exception) { null }
+            // finish() may have added a replacement outcome while saving.
+            // MediaStoreSaver.save only returns a non-null URI after matches(resolver, uri, expected) succeeds.
+            val verified = uri?.takeIf { expected != null && expected.bytes > 0 }
+            val latest = app.database.historyDao().byId(current.id) ?: current
+            val updated = if (verified != null) latest.copy(outputUri = verified.toString(), saveState = "SAVED") else latest.copy(saveState = "FAILED")
+            withContext(kotlinx.coroutines.NonCancellable) {
+                app.database.historyDao().update(updated)
+                if (verified != null) withContext(Dispatchers.IO) { File(current.outputUri).delete() }
+            }
+            updated
+        }
+        if (finalizePublication) withContext(kotlinx.coroutines.NonCancellable) {
+            // 相册与 history 已完成，收尾不能被页面生命周期打断。
+            if (saved.saveState == "SAVED") AutoReplacement.saved(app, saved, outputVerified = true)
+            saved.taskId?.let { id ->
+                app.conversionRepository.update(id) {
+                    it.copy(outputUri = saved.outputUri, error = when (saved.saveState) {
+                        "SAVED" -> null
+                        "FAILED" -> "保存失败，可在详情重试"
+                        else -> "转换完成，待保存；可在详情重试"
+                    })
+                }
+                app.conversionRepository.flush()
+            }
+        }
+        return saved
     }
     class ConversionInProgress : IllegalStateException("请等待当前转换结束后删除记录")
 

@@ -196,7 +196,7 @@ interface TaskDao {
     @Query("UPDATE batches SET cancelled = 1 WHERE id = :id") suspend fun cancel(id: String)
 }
 
-@Database(entities = [HistoryEntity::class, QueueItem::class, BatchEntity::class, ReplacementEntity::class], version = 6, exportSchema = true)
+@Database(entities = [HistoryEntity::class, QueueItem::class, BatchEntity::class, ReplacementEntity::class], version = 7, exportSchema = true)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun historyDao(): HistoryDao
     abstract fun taskDao(): TaskDao
@@ -211,6 +211,22 @@ abstract class AppDatabase : RoomDatabase() {
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_history_saveState_createdAt ON history(saveState, createdAt)")
+            }
+        }
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Room 对非空内嵌字段直接读取 SQLite 值，不会用 Kotlin 构造器默认值兜底 NULL。
+                db.execSQL("""
+                    UPDATE tasks SET
+                        result_hasGainMap = COALESCE(result_hasGainMap,
+                            CASE WHEN result_errorCode = 0 THEN COALESCE(result_inputHadGainMap, 0) ELSE 0 END),
+                        result_hasExif = COALESCE(result_hasExif,
+                            (SELECT hasExif FROM history WHERE history.id = tasks.historyId), 0),
+                        result_maxContentBoost = COALESCE(result_maxContentBoost,
+                            (SELECT maxContentBoost FROM history WHERE history.id = tasks.historyId), 1.0)
+                    WHERE result_errorCode IS NOT NULL
+                      AND (result_hasGainMap IS NULL OR result_hasExif IS NULL OR result_maxContentBoost IS NULL)
+                """.trimIndent())
             }
         }
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -233,8 +249,7 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
         // TranscodeResult 增加输出元数据字段（probe 收敛），tasks 的 result_ 列随之扩展。
-        // 注意必须加成可空列：带 Kotlin 默认值的字段，Room 期望 schema 是可空且无 DEFAULT
-        // （读取 NULL 时回退到 Kotlin 默认值）；NOT NULL DEFAULT 会导致迁移校验失败。
+        // 旧行新增列只能是可空且无 DEFAULT；MIGRATION_6_7 再显式回填，不能依赖 Kotlin 默认值读取 NULL。
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE tasks ADD COLUMN result_hasGainMap INTEGER")

@@ -24,6 +24,11 @@ interface ReplacementDao {
     @Transaction
     suspend fun deleteAll(ids: List<Long>) { ids.chunked(500).forEach { deleteChunk(it) } }
     @Query("SELECT * FROM replacements WHERE historyId = :id") suspend fun byId(id: Long): ReplacementEntity?
+    @Query("SELECT * FROM replacements WHERE historyId IN (:ids)") suspend fun byIdsChunk(ids: List<Long>): List<ReplacementEntity>
+    @Transaction
+    suspend fun byIds(ids: List<Long>): List<ReplacementEntity> {
+        return ids.chunked(500).flatMap { byIdsChunk(it) }
+    }
     @Query("SELECT * FROM replacements WHERE state = 'READY' ORDER BY historyId") fun ready(): Flow<List<ReplacementEntity>>
     @Query("UPDATE replacements SET state = :state, note = :note WHERE historyId IN (:ids)")
     suspend fun finishChunk(ids: List<Long>, state: String, note: String)

@@ -119,8 +119,22 @@ android {
 
 
     sourceSets.getByName("androidTest").assets.srcDir("../tests/fixtures/libultrahdr")
+    sourceSets.getByName("androidTest").assets.srcDir("schemas")
 
     experimentalProperties["android.experimental.enableScreenshotTest"] = true
+
+    val screenshotReferenceDir = file("src/screenshotTestDebug/reference").absoluteFile
+    val screenshotProjectRoot = rootProject.projectDir.absoluteFile
+    tasks.withType<Test>().configureEach {
+        if (name.startsWith("validate") && name.endsWith("ScreenshotTest")) {
+            doFirst {
+                // 测试引擎直接解析 referenceImageDir，不能让模块工作目录拼出 app/app/src。
+                systemProperty("PreviewScreenshotTestEngineInput.referenceImageDir", screenshotReferenceDir.absolutePath)
+                systemProperty("PreviewScreenshotTestEngineInput.projectRoot", screenshotProjectRoot.absolutePath)
+                systemProperty("file.encoding", "UTF-8")
+            }
+        }
+    }
 
     buildFeatures {
         compose = true

@@ -4,6 +4,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.ultraslim.data.HistoryEntity
 import app.ultraslim.util.outputName
 import app.ultraslim.convert.OutputStore
+import app.ultraslim.convert.QueueItem
+import app.ultraslim.convert.QueueStatus
 import java.io.File
 import android.net.Uri
 import kotlinx.coroutines.runBlocking
@@ -63,10 +65,17 @@ class OutputStoreTest {
             format="JPEG",inputFormat="JPEG",durationMs=1.0,maxContentBoost=1f,createdAt=System.currentTimeMillis(),
             status="DONE",taskId=task,saveState="PENDING")
         row = row.copy(id=app.database.historyDao().insert(row))
+        app.conversionRepository.awaitReady()
+        app.conversionRepository.addAll(listOf(QueueItem(id = task, uri = row.inputUri,
+            displayName = row.displayName, sizeBytes = 100, status = QueueStatus.DONE,
+            outputUri = file.path, historyId = row.id)))
+        app.conversionRepository.flush()
         var savedUri: Uri? = null
         try {
             val failed = OutputStore.save(app,row)
             assertEquals("FAILED",failed.saveState)
+            assertEquals(file.path, app.conversionRepository.find(task)?.outputUri)
+            assertNotNull(app.conversionRepository.find(task)?.error)
             file.parentFile!!.mkdirs()
             instrumentation.context.assets.open("minnie-320x240-yuv-icc.jpg").use { input -> file.outputStream().use { input.copyTo(it) } }
             val shared = OutputStore.uri(app, file.path, row.displayName)
@@ -76,6 +85,8 @@ class OutputStoreTest {
             val saved = OutputStore.save(app,failed)
             assertEquals("SAVED",saved.saveState); assertFalse(file.exists())
             savedUri = Uri.parse(saved.outputUri)
+            assertEquals(saved.outputUri, app.conversionRepository.find(task)?.outputUri)
+            assertNull(app.conversionRepository.find(task)?.error)
             assertEquals("image/jpeg",app.contentResolver.getType(savedUri))
             assertEquals(saved.outputUri,OutputStore.save(app,failed).outputUri)
             app.contentResolver.query(savedUri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)!!.use {

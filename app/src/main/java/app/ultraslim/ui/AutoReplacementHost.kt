@@ -52,14 +52,18 @@ internal fun AutoReplacementHost(): ReplacementReview? {
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val ids = activeIds.toList()
         scope.launch {
-            val rows = ids.mapNotNull { app.database.replacementDao().byId(it) }
+            val rows = app.database.replacementDao().byIds(ids)
             val confirmed = result.resultCode == Activity.RESULT_OK
             if (!confirmed) {
                 val remaining = app.database.replacementDao().ready().first()
                 AutoReplacement.finish(app, remaining, "CANCELLED", "已取消待处理替换，原图保留")
             }
             val trashed = withContext(Dispatchers.IO) {
-                rows.filter { confirmed && MediaStoreTrashHelper.isOriginalTrashed(app, Uri.parse(it.sourceUri)) }
+                if (!confirmed) emptyList()
+                else {
+                    val states = MediaStoreTrashHelper.originalStates(app, rows.map { Uri.parse(it.sourceUri) })
+                    rows.filter { states[Uri.parse(it.sourceUri)] == MediaStoreTrashHelper.OriginalState.TRASHED }
+                }
             }
             AutoReplacement.finish(app, trashed, "DONE", "原图已移入系统回收站")
             AutoReplacement.finish(app, rows - trashed.toSet(), "CANCELLED", "未确认替换，原图保留")

@@ -6,6 +6,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.ultraslim.convert.*
 import app.ultraslim.data.*
 import app.ultraslim.model.OutputFormat
+import app.ultraslim.ui.history.HistoryViewModel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import org.junit.Assert.*
@@ -70,7 +71,6 @@ class AutoReplacementTest {
             AutoReplacement.stage(app, history, digest)
             assertEquals("PREPARED", app.database.replacementDao().byId(history.id)?.state)
             val saved = OutputStore.save(app, history)
-            AutoReplacement.saved(app, saved)
             val row = app.database.replacementDao().byId(history.id)!!
             assertEquals("READY", row.state)
             AutoReplacement.validate(app, row)
@@ -96,8 +96,7 @@ class AutoReplacementTest {
     @Test fun cancellationAndTurningOffBlockAnAlreadySavedReplacement() = runBlocking {
         fixture { history, source, _ ->
             AutoReplacement.stage(app, history, AutoReplacement.fingerprint(app, source))
-            val saved = OutputStore.save(app, history)
-            AutoReplacement.saved(app, saved)
+            OutputStore.save(app, history)
             val row = app.database.replacementDao().byId(history.id)!!
             app.settingsRepository.setAutoReplaceOriginals(false)
             assertTrue(runCatching { AutoReplacement.validate(app, row) }.isFailure)
@@ -105,6 +104,26 @@ class AutoReplacementTest {
             app.database.taskDao().cancel(history.batchId)
             assertTrue(runCatching { AutoReplacement.validate(app, row) }.isFailure)
             assertFalse(MediaStoreTrashHelper.isOriginalTrashed(app, source))
+        }
+    }
+
+    @Test fun relinkedHistoryNeverUsesStaleTrashableUri() = runBlocking {
+        org.junit.Assume.assumeTrue(MediaStoreTrashHelper.isTrashSupported)
+        fixture { history, source, output ->
+            val second = MediaStoreSaver.save(app, output, "relinked-${history.id}.jpg", OutputFormat.JPEG)!!
+            try {
+                val vm = HistoryViewModel(app)
+                vm.ensureTrashableResolved(listOf(history))
+                withTimeout(10_000) { vm.trashableOriginals.first { it[history.id] == source } }
+                val relinked = history.copy(inputUri = second.toString())
+                app.database.historyDao().update(relinked)
+                vm.ensureTrashableResolved(listOf(relinked))
+                withTimeout(10_000) { vm.trashableOriginals.first { it[history.id] == second } }
+                assertNotEquals(source, vm.trashableOriginals.value[history.id])
+                assertNotNull(vm.requestTrashSelected(setOf(history.id)))
+            } finally {
+                app.contentResolver.delete(second, null, null)
+            }
         }
     }
 

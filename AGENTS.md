@@ -77,7 +77,7 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - probe 次数收敛：`transcodeImage` 的输入 probe 把已初始化的 uhdr decoder 直接移交 `transcodeUnchecked`（JXL 分支复用 probe 结果，SDR 不再建 decoder）；rebuild 路径从内存缓冲校验输出，不再整读输出文件；`TranscodeResult` 携带 hasGainMap/hasExif/maxContentBoost，worker 不再对输出做第二次 probe。preserve 路径的输出元数据由 `tryReuseGainMap` 直接报告。
 - 所有解码路径共享 1 亿像素上限 `kMaxPixels`（JXL 此前缺失）；JXL box 上限为 `kMaxBoxBytes`。
 - 批次快照解析（decodeDefaults/JSONArray）必须容错：旧快照缺字段按默认值，损坏批次显式置 FAILED，不得在 checkpoint 循环外抛异常静默死亡。仅两个兼容开关例外：缺字段按 false（像素精确语义）。
-- Room 迁移加列的写法：带 Kotlin 默认值的字段（如 TranscodeResult 的新字段），期望 schema 是**可空且无 DEFAULT**（读 NULL 回退 Kotlin 默认值）；写 `NOT NULL DEFAULT 0` 会过不了迁移校验、真机升级即崩。此缺陷只有设备测试能拦——JVM 单测与 host ctest 都覆盖不到。
+- Room 迁移加列的写法：带 Kotlin 默认值的字段（如 TranscodeResult 的新字段），期望 schema 是**可空且无 DEFAULT**；但 Room 读取非空内嵌字段时**不会**把 NULL 回退为 Kotlin 构造器默认值，必须显式回填或做读取兜底。`MIGRATION_6_7` 修复已有任务的新输出元数据，空结果保持 NULL；v3/v6 含真实旧结果的设备迁移测试必须覆盖，JVM 单测与 host ctest 不能替代。
 - 前台服务 API 35+ 用 `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING`（manifest 同时声明 dataSync|mediaProcessing）；`setForeground` 失败只标记未完成项；温控重试有指数退避与 8 次上限，超限停回 READY 等手动继续。
 - 历史页展开态按行虚拟化（每条记录独立 LazyColumn item，折叠态不发射行）；首页队列流经 150ms 采样后再进 UI 状态；回收站原图解析（逐条 MediaStore 查询）只在 Default 线程做，组合期只读缓存。
 - HDR 扫描（整库/相册）经 `probePermits` 并发（4 路），probe 是轻量头部解析不是编码；PreviewCache 解码在 diskLock 之外、原生解码槽位 2。转码写盘路径必须检查 flush/close（stdio 缓冲写失败到 close 才暴露），readAll/writeAll 对 EINTR 重试。`apple-live` 本机跑 `swift test` 必须外置 scratch 目录（`--scratch-path /tmp/...`），iCloud 同步目录的 FileProvider xattr 会让 codesign 拒绝测试包；native/deps 依赖声明必须带 URL_HASH（改版本时重新计算 SHA256）。
@@ -101,7 +101,7 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - 原生正确性：HDR 重建路径的输入内存释放（`data.clear()`）必须发生在 HEIF EXIF 回退提取**之后**；SDR/重建编码失败统一 `ftruncate(0)` 清输出 fd；`decodeJpegSdr` 短读视为失败（截断码流不再产出灰底图）；JXL box 倍增受 `kMaxBoxBytes` 约束（errorCode 32）。
 - `ultraslim` target 已加 `-fvisibility=hidden` + `--gc-sections` + `--exclude-libs,ALL`（动态符号 10,262 → 216，.so 约 20.6MB → 17.5MB）；`core`/`image_io` 带 `-ffunction-sections` 才能让 gc-sections 生效。`decodePreviewJpeg` 入口自行初始化 `ultraslim_codec_threads`（不经过 transcodeUnchecked），否则 parallelRows 退化为单线程。
 - 同步盘冲突副本（`xxx 2.so` / `libheif 3.a`）曾泄漏进 APK（3 份 20MB .so）；packaging 加 `jniLibs.excludes += "**/* *.so"` 防御，prefix 副本已清理。项目仍在同步目录时此防御不能撤。**勿改回 `"**/* [0-9].so"`**：Gradle 的 Ant 模式里 `[0-9]` 是「匹配 `0`、`-`、`9` 之一」的字符类而非数字范围，那个写法一个文件都排除不掉（2026-10-17 实测查实，见下文该批次）。
-- Room 版本 6：新增 `(saveState, createdAt)` 索引（flowPage/flowCount/pendingPublications）。批量 API：`HistoryDao.noteReplacement/deleteByIds`、`ReplacementDao.deleteAll`、`OutputStore.deleteBatch`、`ConversionRepository.updateAll`——批量场景禁止逐条 update（每条都触发全量 diff + 表 invalidation）。
+- Room 当前版本 7：v6 新增 `(saveState, createdAt)` 索引，v7 回填旧任务的输出元数据。批量 API：`HistoryDao.noteReplacement/deleteByIds`、`ReplacementDao.deleteAll/byIds`、`OutputStore.deleteBatch`、`ConversionRepository.updateAll`——批量场景禁止逐条 update/byId（每条都触发全量 diff、表 invalidation 或 provider 往返）。
 - Home 统计改用单条 `flowStats()` + 500ms 节流（原 totalSaved+countDone 两次全表聚合且未节流）；扫描/导入进度按批（16/8 张）发射；`scannedProbes` 在扫描结束 finally 清空（persist 有权限时返回原 URI，键才匹配）。
 - `PreviewCache` 的 content URI version（size:mtime）有 2 秒 TTL 缓存，内存命中不再必先做 provider 查询；大图档降采样走 `inSampleSize`；设置页清缓存挪到 IO 线程。`DetailViewModel.requestTrashOriginal` 改 suspend + IO（原在主线程做 MediaStore 查询）；DetailViewModel 只有一条 flowById 订阅，按 inputUri 去重后才做回收站检查。
 - 自动替换管线：`stage` 中 source/target 解析到同一 URI 时只哈希一次；`saved()` 的 validate 跳过原图重哈希（`recheckSource=false`，回收前的 trash 时校验仍保留）——saved 时机不做破坏性操作，安全性不依赖这次哈希。
@@ -115,3 +115,11 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - 已实测并否决的伪优化，勿重复尝试：容器重复解析（单次 0.01–0.03ms，占 26MP 整次转码 2126ms 的 0.002%；且 HEIF 的「双解析」是 `hasExif` 的唯一来源，`uhdr_dec_get_exif` 对 HEIF/AVIF 返回 null）；`parallelRows` 进程级线程池（spawn+join 0.03ms/次）；依赖库 LTO。
 - 构建路径脱敏：`native/CMakeLists.txt` 的 `-ffile-prefix-map` 必须先用 `get_filename_component(... REALPATH)` 把 `${CMAKE_CURRENT_SOURCE_DIR}/..` 归一到仓库根再映射——字面量 `.../native/..` 不是 `.../third_party/libultrahdr/...` 的文本前缀，否则 vendored 源码的 `__FILE__`（assert 串）会残留构建机绝对路径。
 - 2026-10-17 批次完整数据、验证结论与仍未立项的缺口见 [docs/TODO-optimizations.md](docs/TODO-optimizations.md) 与 [docs/reports/2026-10-17-optimization-batch.md](docs/reports/2026-10-17-optimization-batch.md)。
+
+## 正确性与验证批次（2026-10-24）
+
+- JXL 的 `jhgm` 必须由 `parseJhgmLayout` 做剩余长度校验，probe 与 preserve 共用；存在但损坏的 gain map 明确报错，不得当成 SDR。libjxl 默认已应用 codestream orientation，SDR/预览只对 JPEG 额外应用 EXIF 旋转。`scaledSize` 使用 64 位中间乘法；JPEG mem destination 错误路径在 destroy/free 前同步当前指针，不能改成已否决的成功路径缓冲接管。
+- 当前编码仍不保留主图 alpha：HEIF/AVIF/JXL 含 alpha 时 SDR 和 HDR preserve 均返回 errorCode 33 并保持输出为空，不能静默丢通道；预览仍允许。完整 alpha 编码支持另立项，透明 AVIF 及透明 HDR HEIF/AVIF 的独立端到端覆盖仍待补。
+- `OutputStore.save` 默认统一推进替换日志和队列；`ConversionRunner` 传 `finalizePublication=false` 并自行做专用 checkpoint，避免批量双写。history 保存状态落地后，队列与替换收尾不可被页面取消打断。历史回收缓存以 `(id, inputUri)` 为键，发起回收前重查当前行；重新关联的 Provider 检查只在 IO 收集器执行。
+- JPEG 实况 XMP 合并使用一次精确分配，不再叠加约 3 倍静图堆；自动替换回调使用 `ReplacementDao.byIds` 和批量 `originalStates()`。详情卷帘比例只保留一个 `SliderState`，不在卡片根组合期逐帧读取。
+- 发布/补丁 Python 校验不得依赖 `assert`（`python3 -O` 也必须失败）。原生依赖并发由 `ULTRASLIM_DEPS_TOTAL_JOBS`（默认 4）和 `ULTRASLIM_DEPS_PROJECT_JOBS`（默认 2）约束，内层含 dav1d Ninja 均显式限流。截图任务通过 `PreviewScreenshotTestEngineInput.referenceImageDir/projectRoot` 传绝对路径并固定 UTF-8；基线更新必须先检查实际差异。Android JNI 格式往返覆盖 codec 0–3，Room schema 同时打入 androidTest assets 供真实迁移测试。

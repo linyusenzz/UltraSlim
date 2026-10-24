@@ -81,5 +81,6 @@ new = '''  // UltraSlim: bound AVIF primary dimensions for platform decoders.
     }
     return std::static_pointer_cast<ImageItem>(grid.value);
   }();'''
-assert old in s, 'upstream primary image encoder changed'
+if old not in s:
+    raise RuntimeError('upstream primary image encoder changed')
 p.write_text(s.replace(old, new))

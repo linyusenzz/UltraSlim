@@ -3,7 +3,7 @@ package app.ultraslim.model
 /** Output container for the transcoded image. */
 enum class OutputFormat(
     val extension: String,
-    /** Codec id understood by UltraHdrBridge.nativeTranscode (0 = JPEG, 1 = HEIC, 2 = AVIF). */
+    /** Codec id understood by UltraHdrBridge.nativeTranscode (0 = JPEG, 1 = HEIC, 2 = AVIF, 3 = JXL). */
     val codecId: Int,
     val label: String,
     val mimeType: String,

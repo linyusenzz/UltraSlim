@@ -6,6 +6,11 @@ project(ultraslim_deps C CXX)
 
 include(ExternalProject)
 
+set(DEPS_INNER_JOBS "2" CACHE STRING "Maximum direct build-tool jobs per dependency project")
+if(NOT DEPS_INNER_JOBS MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "DEPS_INNER_JOBS must be a positive integer (got: ${DEPS_INNER_JOBS})")
+endif()
+
 if(NOT DEFINED DEPS_PREFIX)
   message(FATAL_ERROR "Pass -DDEPS_PREFIX=<install prefix>")
 endif()
@@ -56,7 +61,7 @@ ExternalProject_Add(libjpeg-turbo
                -DWITH_12BIT=OFF
                -DWITH_ARITH_ENC=ON
                -DWITH_ARITH_DEC=ON
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # ---------------------------------------------------------------- x265 (HEVC encoder, 8-bit)
@@ -89,7 +94,7 @@ ExternalProject_Add(x265
                -DHIGH_BIT_DEPTH=OFF
                -DENABLE_HDR10_PLUS=OFF
                -DENABLE_LIBVMAF=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # ---------------------------------------------------------------- aom (AV1 decoder + lossless 4:4:4 gain map encoder)
@@ -107,7 +112,7 @@ ExternalProject_Add(aom
                -DCONFIG_MULTITHREAD=1
                -DCONFIG_WEBM_IO=0
                -DCONFIG_LIBYUV=0
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # ---------------------------------------------------------------- svt-av1 (fast AV1 encoder)
@@ -120,7 +125,7 @@ ExternalProject_Add(svt-av1
                -DBUILD_TESTING=OFF
                -DSVT_AV1_LTO=ON
                -DCOMPILE_C_ONLY=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # ---------------------------------------------------------------- dav1d (AV1 decoder)
@@ -135,7 +140,7 @@ ExternalProject_Add(dav1d
         --buildtype release --default-library static --prefix=${DEPS_PREFIX}
         -Denable_tests=false -Denable_tools=false -Dbitdepths=8
         ${DAV1D_MESON_CROSS_ARGS}
-    BUILD_COMMAND ninja -C <BINARY_DIR>
+    BUILD_COMMAND ninja -C <BINARY_DIR> -j ${DEPS_INNER_JOBS}
     INSTALL_COMMAND meson install -C <BINARY_DIR>)
 
 # ---------------------------------------------------------------- libde265 (HEVC decoder)
@@ -146,7 +151,7 @@ ExternalProject_Add(libde265
                -DENABLE_SDL=OFF
                -DENABLE_DECODER=OFF
                -DENABLE_ENCODER=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # ---------------------------------------------------------------- libheif (container)
@@ -184,7 +189,7 @@ ExternalProject_Add(libheif
                -DWITH_VVENC=OFF
                -DWITH_UVG266=OFF
                -DWITH_KVAZAAR=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel --target heif
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${DEPS_INNER_JOBS} --target heif
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
 # Changes to local patches must invalidate an existing superbuild, not only a fresh clone.
@@ -232,7 +237,7 @@ ExternalProject_Add(libjxl
                -DJPEGXL_ENABLE_SJPEG=OFF
                -DJPEGXL_ENABLE_SKCMS=ON
                -DJPEGXL_ENABLE_PLUGINS=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target jxl jxl_cms jxl_threads brotli --parallel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target jxl jxl_cms jxl_threads brotli --parallel ${DEPS_INNER_JOBS}
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 ExternalProject_Add_Step(libjxl verify_pin
     COMMAND ${CMAKE_COMMAND} -DSRC_DIR=<SOURCE_DIR> -DEXPECTED=${ULTRASLIM_LIBJXL_COMMIT}

@@ -138,7 +138,7 @@ internal class ConversionRunner(
                         var verifiedSave = false
                         if (options.autoSave && app.database.taskDao().batch(batchId)?.cancelled == false &&
                             app.galleryPublishingAllowed.value) {
-                            existing = OutputStore.save(app, existing)
+                            existing = OutputStore.save(app, existing, finalizePublication = false)
                             verifiedSave = existing.saveState == "SAVED"
                         }
                         if (options.autoReplaceOriginals) AutoReplacement.saved(app, existing, outputVerified = verifiedSave)
@@ -248,7 +248,7 @@ internal class ConversionRunner(
                     // 指纹和自动替换校验会挂起；此时用户可能已切后台或取消批次，不能复用先前状态。
                     if (options.autoSave && app.database.taskDao().batch(batchId)?.cancelled == false &&
                         app.galleryPublishingAllowed.value) {
-                        entity = OutputStore.save(app, entity, outputFingerprint)
+                        entity = OutputStore.save(app, entity, outputFingerprint, finalizePublication = false)
                         verifiedSave = entity.saveState == "SAVED"
                     }
                     if (options.autoReplaceOriginals) AutoReplacement.saved(app, entity, outputVerified = verifiedSave)

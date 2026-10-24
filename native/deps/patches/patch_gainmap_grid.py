@@ -50,5 +50,6 @@ new = '''  // UltraSlim: lossless gain-map grid for bounded decoder input packet
     if (encoded.error) return encoded.error.error_struct(ctx->context.get());
     gain_map_image_item = encoded.value;
   }'''
-assert old in s, 'upstream gain-map encoder changed'
+if old not in s:
+    raise RuntimeError('upstream gain-map encoder changed')
 p.write_text(s.replace(old, new))

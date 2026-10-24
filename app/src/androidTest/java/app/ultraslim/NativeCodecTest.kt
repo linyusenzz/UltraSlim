@@ -103,7 +103,7 @@ class NativeCodecTest {
         try {
             val source = File(dir,"source.jpg")
             instrumentation.context.assets.open("apple_gainmap_new.jpg").use { input -> source.outputStream().use { input.copyTo(it) } }
-            for (codec in 0..2) {
+            for (codec in 0..3) {
                 var input = source
                 repeat(2) { pass ->
                     val output = File(dir,"out-$codec-$pass")
@@ -113,6 +113,7 @@ class NativeCodecTest {
                             assertTrue("codec=$codec pass=$pass ${result.error}",result.isSuccess)
                             val probe = UltraHdrBridge.nativeProbe(b.fd)
                             assertTrue(probe.error,probe.isSuccess); assertTrue(probe.hasGainMap); assertTrue(probe.hasExif)
+                            assertEquals("codec=$codec pass=$pass", codec, probe.container)
                             assertEquals(result.gainmapWidth,probe.gainmapWidth)
                             assertNotNull(UltraHdrBridge.nativeDecodePreview(b.fd,128))
                         }

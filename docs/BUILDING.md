@@ -27,13 +27,15 @@ native/deps/build_deps.sh android arm64-v8a "$ANDROID_HOME/ndk/27.2.12479018" 26
 
 下载与中间产物保存在 `native/deps/build/<flavor>/`，静态库和头文件安装到 `native/prefix/<flavor>/`。两者均被 Git 忽略。源码 URL、版本、下载散列和编译选项在 [原生依赖配置](../native/deps/CMakeLists.txt)，本地补丁在 `native/deps/patches/`。修改补丁后需要重新运行对应依赖构建。
 
+依赖超级构建默认总任务预算为 4、外层项目并发为 2，内层编译任务（含 dav1d 的 Ninja）按两者计算上限。可用正整数环境变量调整，例如 `ULTRASLIM_DEPS_TOTAL_JOBS=8 ULTRASLIM_DEPS_PROJECT_JOBS=2 native/deps/build_deps.sh host`；外层并发不会超过总预算。该预算约束 superbuild 及其直接调用的构建工具，不保证第三方自定义子进程。
+
 ## 一键验证
 
 ```bash
 scripts/verify.sh
 ```
 
-依次执行仓库结构/素材检查、主机 CTest、Debug/Release 构建、JVM 单测、lint 和最终 APK 的 16 KB 对齐检查。主机测试目录为 `$ULTRASLIM_BUILD_ROOT/host-test`；不再往仓库根目录创建 `build-host-test/`。
+依次执行仓库结构/素材检查、主机 CTest、Debug/Release 构建、JVM 单测、lint、Compose 截图回归和最终 APK 的 16 KB 对齐检查。主机测试目录为 `$ULTRASLIM_BUILD_ROOT/host-test`；不再往仓库根目录创建 `build-host-test/`。
 
 ```bash
 # 只构建 Android；已完成 Android 原生依赖准备即可。
