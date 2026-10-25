@@ -19,6 +19,7 @@ import androidx.core.content.ContextCompat
 import androidx.work.*
 import app.ultraslim.R
 import app.ultraslim.UltraSlimApp
+import app.ultraslim.bridge.ProbeResult
 import app.ultraslim.bridge.UltraHdrBridge
 import app.ultraslim.data.*
 import app.ultraslim.util.formatBytes
@@ -43,6 +44,31 @@ internal class ConversionRunner(
 
     internal fun currentThermalStatus() = thermalStatus()
 
+    private fun memoryInfo() = ActivityManager.MemoryInfo().also {
+        applicationContext.getSystemService(ActivityManager::class.java).getMemoryInfo(it)
+    }
+
+    /**
+     * 内存准入：批量内上一张的原生大块内存归还 OS 有滞后，先按退避复测（合计约 9s）再判死，
+     * 避免上张刚结束时的瞬时紧张把后续条目连环误拒。判死时按「估算是否超过本机理想容量」
+     * 区分「本机放不下」与「当下紧张」两种文案。
+     */
+    private suspend fun awaitMemoryAdmission(probe: ProbeResult, inputBytes: Long) {
+        var mem = memoryInfo()
+        for (attempt in 1..MEMORY_ADMISSION_RECHECKS) {
+            if (ConversionBudget.canStart(probe.width, probe.height, probe.gainmapWidth, probe.gainmapHeight,
+                    probe.hasGainMap, inputBytes, mem.availMem, mem.totalMem, mem.threshold, mem.lowMemory)) return
+            delay(MEMORY_ADMISSION_DELAY_MS * attempt)
+            mem = memoryInfo()
+        }
+        val estimate = ConversionBudget.estimateBytes(probe.width, probe.height, probe.gainmapWidth,
+            probe.gainmapHeight, probe.hasGainMap, inputBytes)
+        if (estimate >= ConversionBudget.deviceCapacityBytes(mem.totalMem, mem.threshold)) {
+            error("这张照片需要的内存超出本机可用上限，无法安全转码；已保留原图")
+        }
+        error("系统内存暂时紧张，已保留原图；请稍后重试")
+    }
+
     internal suspend fun pauseCooling(): Outcome {
         val app = applicationContext as UltraSlimApp
         val state = app.conversionThermalState.value ?: return Outcome.FAILED
@@ -64,6 +90,8 @@ internal class ConversionRunner(
         const val NOTIFICATION_ID = 42
         private const val SUMMARY_ID = 43
         const val KEY_BATCH = "batch_id"
+        private const val MEMORY_ADMISSION_RECHECKS = 3
+        private const val MEMORY_ADMISSION_DELAY_MS = 1500L
     }
     fun getForegroundInfo() = createForegroundInfo(0, "正在准备转换…", null, true)
 
@@ -168,11 +196,7 @@ internal class ConversionRunner(
 
                     val file = File(app.filesDir, "outputs/$id.${options.format.extension}").apply { parentFile?.mkdirs() }
                     suspend fun transcode(quality: Int) = ImageWork.run("encode ${options.format} ${probe.width}x${probe.height}") {
-                        val mem = ActivityManager.MemoryInfo().also { app.getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
-                        check(ConversionBudget.canStart(probe.width, probe.height, probe.gainmapWidth, probe.gainmapHeight,
-                            probe.hasGainMap, item.sizeBytes, mem.availMem, mem.totalMem, mem.threshold, mem.lowMemory)) {
-                            "可用内存不足以安全处理这张照片，已保留原图；请稍后重试"
-                        }
+                        val mem = memoryInfo()
                         val threads = ConversionBudget.threads(Runtime.getRuntime().availableProcessors())
                         android.util.Log.i("UltraSlimConversion", "encode format=${options.format} size=${probe.width}x${probe.height} threads=$threads available=${mem.availMem}")
                         app.contentResolver.openFileDescriptor(source, "r")!!.use { input ->
@@ -186,6 +210,8 @@ internal class ConversionRunner(
                             }
                         }
                     }
+                    // 上一张的大块原生内存归还 OS 有滞后，内存不足先在编码槽位外退避复测再判死。
+                    awaitMemoryAdmission(probe, item.sizeBytes)
                     // Native retry reuses prepared pixels and the lossless gain map.
                     var result = transcode(options.quality)
                     if (!result.isSuccess) { file.delete(); error(result.error) }
