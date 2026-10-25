@@ -123,6 +123,7 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - `OutputStore.save` 默认统一推进替换日志和队列；`ConversionRunner` 传 `finalizePublication=false` 并自行做专用 checkpoint，避免批量双写。history 保存状态落地后，队列与替换收尾不可被页面取消打断。历史回收缓存以 `(id, inputUri)` 为键，发起回收前重查当前行；重新关联的 Provider 检查只在 IO 收集器执行。
 - JPEG 实况 XMP 合并使用一次精确分配，不再叠加约 3 倍静图堆；自动替换回调使用 `ReplacementDao.byIds` 和批量 `originalStates()`。详情卷帘比例只保留一个 `SliderState`，不在卡片根组合期逐帧读取。
 - 发布/补丁 Python 校验不得依赖 `assert`（`python3 -O` 也必须失败）。原生依赖并发由 `ULTRASLIM_DEPS_TOTAL_JOBS`（默认 4）和 `ULTRASLIM_DEPS_PROJECT_JOBS`（默认 2）约束，内层含 dav1d Ninja 均显式限流。截图任务通过 `PreviewScreenshotTestEngineInput.referenceImageDir/projectRoot` 传绝对路径并固定 UTF-8；基线更新必须先检查实际差异。Android JNI 格式往返覆盖 codec 0–3，Room schema 同时打入 androidTest assets 供真实迁移测试。
+- 内存准入重校准（2026-10-25 实施，依据 2026-10-24 实测）：`ConversionBudget.estimateBytes` = 192MiB 基线 + HDR 36B/px（SDR 16）+ 增益图 4B/px + 输入字节一份；预算端 availMem/2 与 availMem − max(threshold, 512MiB) 取小。旧公式增益图按 16B/px 全额计（preserve mono 实际 1B/px，虚高 16 倍）且预算端再叠 availMem/3 + total/5，双重叠加约 5× 保守，8GB 设备常态误报「内存不足」。实测锚点：HDR preserve 峰值 RSS 12MP→609MB、25MP→1035MB，`ConversionBudgetTest.estimateStaysAnchoredToMeasuredPeak` 固化上下界，勿再加回双重余量。`ConversionRunner.awaitMemoryAdmission` 在进入编码槽位（ImageWork 单线程 dispatcher）前按 1.5s/3s/4.5s 退避复测——批量内上一张的大块原生内存归还 OS 有滞后，瞬时紧张不再直接判死；复测仍不过才失败，并用 `deviceCapacityBytes`（total − 水位）区分「本机放不下」与「暂时紧张」两种文案。无泄漏：单进程连转 6 次 RSS 稳定，不要再朝泄漏方向排查。
 
 ## 动态照片厂商兼容（2026-10-25）
 
@@ -133,3 +134,10 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - `validVideo` 的「ftyp 首 box + moov + mdat + 干净走到 EOF」是误报防线，不得为兼容厂商格式放宽。检测不到的私有实况仍按纯静态转码（视频丢失）；荣耀样本到位前不做臆测规则，新厂商必须先用真实文件固定布局再写解析。
 - 厂商样本分析用 `scripts/motion_inspect.py`：JPEG 段/HEIF box、XMP 运动字段与目录项、ftyp 位置、尾部 hexdump、厂商标记，并复刻 detect() 判定路径（含 OPPO 优先顺序与可打印 box type 校验，须与 Kotlin 同步修改）。
 - Google Photos 本地查看 HEIC 增益图存在逐文件不触发 HBM 的现象（2026-10-25 排查，已闭环）：同批结构等价文件 2/4 触发，容器结构、tmap 元数据、NCLX、增益图 hvcC/SPS 全部逐字节等价、与原图元数据/高光统计逐项一致，原图 JPG 与 App JPEG 输出全触发；小米自带相册不支持 HEIC Ultra HDR（0/4，平台已知限制）。文件侧已穷尽；用户实测 **App 的 AVIF 输出 4/4 全部触发 HBM**——Google 的 AVIF 增益图管线可靠、HEIC 管线挑食。口径（2026-10-25 真机实测定稿）：Google Photos 静态 HDR 用 AVIF（4/4 触发 HBM）；**动态照片用 JPEG**——Google Photos 实测不播 AVIF 主图动态（mpvd+XMP 完全合规、用户自装看图软件可识别播放，属 Google 侧未支持，未来支持即自动受益）。`attachMotionPhoto` 支持 JPEG/HEIC/AVIF 三目标（ISOBMFF 主图统一走 mpvd），JVM 用例 + 真机 MotionPhotoIntegrationTest 含 AVIF 往返，真实样本 `样张/Photo_*_MP.avif` 入 VendorMotionSampleTest。JXL 主图规范未定义动态照片，仍导出静态。另实测：macOS 预览对带增益图的 AVIF 会列出两个图项（主图 + 灰度增益图 item）——ISO 21496-1 的增益图本就是独立 image item，按 item 枚举的查看器会展示，macOS 对 HEIC 的 tmap 会隐藏、对 AVIF 不会；这是格式与查看器行为，不是输出缺陷，勿改输出侧。排查工具：`rendition_dump`（stdout 的 meta/min-maxBoost/hdr高光统计可信，`_hdr.raw` 落盘有全零 bug 待修）、`gm_dump`、`scripts/heif_inspect.py`。
+
+## 性能批次（2026-10-25）
+
+- **AVIF 无损增益图 speed 映射 {4,6,8}→{6,8,9}**（`attachGainMap`）：profile 显示 26MP AVIF preserve 中主图 SVT 占 84%、增益图 AOM 无损占 13%；lossless 下 speed 不影响像素，只影响耗时与体积。host（M5 Max, threads=8, q82, 真机 26MP 样张）AVIF 整体 2612→2109ms（**-19%**），体积 +1.6%（+30KB，全部来自增益图 item），3 次运行 md5 稳定；host ctest 7/7 通过（含 gainmap_preservation 逐字节重试等价）。真机收益待设备验证。
+- **x265 pmode/pme 已实测否决，勿再加**：单帧 I 图静图无帧间参考，分析并行只剩调度开销——26MP HEIC host 1704→1905ms（慢 11%），输出逐字节不变（`configureEncoder` 内有注释）。x265 单帧并行只剩 WPP/pools 一条路。
+- SVT 主图扩展性数据：threads 4→8 仅 -16%（2517→2109ms），瓶颈在 libheif grid 逐 tile 串行过同一个 encoder 实例（26MP = 9 个 ~2048² tile）；跨 tile/多 encoder 实例并行需改 libheif，未立项。
+- 排查手法：macOS `sample <pid>` 直接采 host 转码画像（无需改代码），主线程 `semaphore_wait_trap` = 在等编码器工作线程；`样张/MVIMG_20261025_003408.jpg`（4416×5888 HDR + 半分辨率增益图）为 26MP 基准样张。

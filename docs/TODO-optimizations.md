@@ -83,6 +83,18 @@
 
 验证与设备边界见 [2026-10-24 优化记录](reports/2026-10-24-optimization-batch.md)。
 
+## 已完成（2026-10-25 批次）
+
+- **AVIF 无损增益图 speed {4,6,8}→{6,8,9}**：26MP AVIF preserve 画像（macOS `sample`）主图 SVT 84%、
+  增益图 AOM 无损 13%；lossless 下 speed 不影响像素。host 实测整体 2612→2109ms（-19%），体积 +1.6%
+  （增益图 item +30KB），输出确定（3 次 md5 一致），host ctest 7/7 通过。真机收益待验证。
+- **x265 pmode/pme 实测否决**：26MP HEIC host 1704→1905ms（慢 11%）、输出逐字节不变——静图单帧无帧间
+  分析可并行，只剩调度开销。已在 `configureEncoder` 留注释，勿再加。
+- **SVT grid tile 串行确认为下一档瓶颈**：threads 4→8 仅 -16%；26MP 主图经 libheif 2048 grid 拆 9 tile、
+  逐个过同一 encoder 实例。跨 tile 并行需改 libheif 补丁，未立项。
+
+验证与设备边界见 [2026-10-17 优化记录](reports/2026-10-17-optimization-batch.md) 与 AGENTS「性能批次（2026-10-25）」。
+
 ## 仍未做（需独立立项）
 
 1. **#20 queryImages 物化整库 URI**：当前只在「整个图库扫描」入口使用（一次性遍历+逐张 probe），

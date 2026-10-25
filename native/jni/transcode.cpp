@@ -1478,6 +1478,8 @@ void configureEncoder(heif_encoder* encoder, int outCodec, int speedLevel, int t
       snprintf(pools, sizeof pools, "%d", threads);
       heif_encoder_set_parameter(encoder, "x265:pools", pools);
       heif_encoder_set_parameter(encoder, "x265:frame-threads", "1");
+      // 注意：勿加 x265:pmode/pme。单帧 I 图实测（M5 Max, 26MP, medium）1704→1905ms
+      // 反而慢 11%，输出逐字节不变——静图无帧间参考，分析并行只剩调度开销。2026-10-25。
     }
   } else {
     static const int kSpeeds[] = {4, 6, 9};
@@ -1758,8 +1760,9 @@ int attachGainMap(heif_context* ctx, heif_image_handle* base, heif_encoder* enco
   configureEncoder(mapEncoder, gm.codec, ultraslim_codec_speed_level, ultraslim_codec_threads);
   if (avif) {
     // 无损增益图用独立的 speed 映射（覆盖 configureEncoder 的通用值）；索引先 clamp。
+    // lossless 下 speed 只影响耗时与轻微体积，不影响像素；质量承诺由主图 SVT 档位承担。
     const int level = ultraslim_codec_speed_level < 0 || ultraslim_codec_speed_level > 2 ? 1 : ultraslim_codec_speed_level;
-    const int speeds[] = {4, 6, 8};
+    const int speeds[] = {6, 8, 9};
     heif_encoder_set_parameter_integer(mapEncoder, "speed", speeds[level]);
   }
   e = heif_encoder_set_lossless(mapEncoder, 1);
