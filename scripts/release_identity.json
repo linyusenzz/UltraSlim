@@ -1,8 +1,8 @@
 {
   "applicationId": "app.ultraslim",
-  "publishedVersionCode": 25,
-  "publishedVersionName": "1.0.2",
+  "publishedVersionCode": 26,
+  "publishedVersionName": "1.0.3",
   "certificateSha256": "e54990c754cbede4e7ab638d800a33b893f1d2f5f29bbacd11528905419a4d39",
-  "apkSha256": "ee27345a260ec343ff633c576643bb7e4bb1f26534c110d547f1a164ca8f8825",
-  "releaseUrl": "https://github.com/linyusenzz/UltraSlim/releases/tag/v1.0.2"
+  "apkSha256": "3c953a00b3e815a49caca1fac0e9bcf2ea8e690c89faa4fe639ce6081ad2e810",
+  "releaseUrl": "https://github.com/linyusenzz/UltraSlim/releases/tag/v1.0.3"
 }
