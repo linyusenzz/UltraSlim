@@ -4,7 +4,6 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
-import android.os.Build
 import android.os.SystemClock
 import androidx.work.ForegroundInfo
 import androidx.core.content.ContextCompat
@@ -175,8 +174,7 @@ class ConversionService : Service() {
 
     private fun promote(info: ForegroundInfo) {
         // Core 1.17 ServiceCompat masks types to the API 34 set and strips mediaProcessing.
-        if (Build.VERSION.SDK_INT >= 29) startForeground(info.notificationId, info.notification, info.foregroundServiceType)
-        else startForeground(info.notificationId, info.notification)
+        startForeground(info.notificationId, info.notification, info.foregroundServiceType)
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {

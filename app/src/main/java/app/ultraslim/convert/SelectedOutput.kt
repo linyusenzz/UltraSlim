@@ -5,7 +5,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.MediaStore
@@ -66,7 +65,6 @@ internal object SelectedOutput {
                 while (it.moveToNext()) { checkCancelled(); it.getString(0)?.let(names::add) }
             } ?: throw IOException("输出目录不可读，请在设置中重新授权同一目录")
         } else {
-            check(Build.VERSION.SDK_INT >= 29) { "保存到相册需要 Android 10；也可选择输出文件夹" }
             parent = MediaStore.Images.Media.getContentUri(volume)
             resolver.query(parent, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
                 "${MediaStore.MediaColumns.RELATIVE_PATH} = ?", arrayOf(path), null)?.use {

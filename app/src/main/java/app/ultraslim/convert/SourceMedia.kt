@@ -2,7 +2,6 @@ package app.ultraslim.convert
 
 import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 
@@ -63,7 +62,7 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
                     val stat = android.system.Os.fstat(it.fileDescriptor)
                     if (!android.system.OsConstants.S_ISREG(stat.st_mode)) return@use null
                     val seconds = stat.st_mtime.takeIf { value -> value > 0 && value <= Long.MAX_VALUE / 1000 } ?: return@use null
-                    seconds * 1000 + if (Build.VERSION.SDK_INT >= 27) stat.st_mtim.tv_nsec / 1_000_000 else 0
+                    seconds * 1000 + stat.st_mtim.tv_nsec / 1_000_000
                 }
             }.getOrNull()
             // Cloud providers may return a temporary download fd; their indexed date wins.
@@ -74,7 +73,6 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
         }
 
         fun read(context: Context, source: Uri): SourceMedia? {
-            if (Build.VERSION.SDK_INT < 29) return null
             val uri = MediaStoreTrashHelper.resolveToMediaStoreImageUri(context, source) ?: return null
             return runCatching {
                 context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.VOLUME_NAME,

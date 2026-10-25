@@ -4,14 +4,13 @@ import android.content.ContentUris
 import android.content.Context
 import android.content.IntentSender
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 
 object MediaStoreTrashHelper {
     // Android 16+ rejects larger requests. This is a system request limit, not a queue limit.
     const val MAX_REQUEST_ITEMS = 2000
-    val isTrashSupported: Boolean get() = Build.VERSION.SDK_INT >= 30
+    val isTrashSupported: Boolean get() = true
     enum class OriginalState { PRESENT, TRASHED, UNAVAILABLE }
     data class Request(val sender: IntentSender? = null, val uris: List<Uri> = emptyList(), val message: String? = null)
 
@@ -33,7 +32,7 @@ object MediaStoreTrashHelper {
             }
             return null
         }
-        if (Build.VERSION.SDK_INT >= 29 && uri.authority in setOf(
+        if (uri.authority in setOf(
                 "com.android.providers.media.documents", "com.android.externalstorage.documents")) {
             val mapped = runCatching { MediaStore.getMediaUri(context, uri) }.getOrNull()
             if (mapped != null && mapped != uri) return resolveToMediaStoreImageUri(context, mapped)

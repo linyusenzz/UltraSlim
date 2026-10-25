@@ -65,7 +65,6 @@ internal object AutoReplacement {
         } ?: error("无法读取文件")
 
     private fun requireReadable(app: UltraSlimApp, uri: Uri, history: HistoryEntity) {
-        if (Build.VERSION.SDK_INT < 30) error("系统不支持回收站")
         check(!history.hadGainMap || Build.VERSION.SDK_INT >= 34) { "系统无法验证 HDR 增益图" }
         val probe = app.contentResolver.openFileDescriptor(uri, "r")?.use { UltraHdrBridge.nativeProbe(it.fd) }
         check(probe != null && probe.isSuccess && probe.width == history.width && probe.height == history.height &&

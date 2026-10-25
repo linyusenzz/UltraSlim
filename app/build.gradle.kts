@@ -59,7 +59,7 @@ android {
 
     defaultConfig {
         applicationId = "app.ultraslim"
-        minSdk = 26
+        minSdk = 31
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // 公开发行版仍沿用测试期递增的 versionCode，确保覆盖升级。
@@ -141,6 +141,9 @@ android {
     }
 
     packaging {
+        // minSdk ≥ 28 起 AGP 默认把 dex 不压缩直存（供 ART mmap），26→31 后实测 Debug APK
+        // 40MB→89MB。本仓库 APK 走 GitHub/Gitea 直链下载，体积优先，压回 deflate。
+        dex.useLegacyPackaging = true
         // Project-built JNI replacement takes precedence; verification checks the packaged bytes.
         jniLibs.pickFirsts += "lib/arm64-v8a/libandroidx.graphics.path.so"
         // 同步盘冲突副本（"xxx 2.so"）不得进 APK——曾把 3 份 20MB 的 libultraslim.so 打进包。

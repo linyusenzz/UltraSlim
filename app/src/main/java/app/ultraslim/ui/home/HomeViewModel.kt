@@ -3,7 +3,6 @@ package app.ultraslim.ui.home
 import android.content.ContentUris
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
@@ -528,9 +527,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             add(MediaStore.Images.Media._ID)
             add(MediaStore.Images.Media.DISPLAY_NAME)
             add(MediaStore.Images.Media.SIZE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(MediaStore.Images.Media.RELATIVE_PATH)
-            }
+            add(MediaStore.Images.Media.RELATIVE_PATH)
         }.toTypedArray()
         app.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -542,11 +539,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             val idIndex = cursor.getColumnIndex(MediaStore.Images.Media._ID)
             val nameIndex = cursor.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
             val sizeIndex = cursor.getColumnIndex(MediaStore.Images.Media.SIZE)
-            val pathIndex = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
-            } else {
-                -1
-            }
+            val pathIndex = cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
             while (cursor.moveToNext()) {
                 if (pathIndex >= 0) {
                     val path = cursor.getString(pathIndex)

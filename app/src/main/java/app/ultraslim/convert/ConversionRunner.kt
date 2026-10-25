@@ -30,9 +30,7 @@ import kotlinx.coroutines.*
 internal class ConversionRunner(
     private val applicationContext: Context,
     private val thermalStatus: () -> Int = {
-        if (Build.VERSION.SDK_INT >= 29)
-            applicationContext.getSystemService(android.os.PowerManager::class.java).currentThermalStatus
-        else 0
+        applicationContext.getSystemService(android.os.PowerManager::class.java).currentThermalStatus
     },
     private val setForeground: suspend (ForegroundInfo) -> Unit,
 ) {
@@ -331,9 +329,8 @@ internal class ConversionRunner(
             // Android 15+ 使用媒体处理类型；两种类型均有后台 6 小时/24 小时限额。
             Build.VERSION.SDK_INT >= 35 ->
                 ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ->
+            else ->
                 ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-            else -> ForegroundInfo(NOTIFICATION_ID, notification)
         }
     }
 

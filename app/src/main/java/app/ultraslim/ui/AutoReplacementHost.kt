@@ -38,7 +38,6 @@ data class ReplacementReview(
 /** Publication is automatic; every system trash request requires an explicit review action. */
 @Composable
 internal fun AutoReplacementHost(): ReplacementReview? {
-    if (android.os.Build.VERSION.SDK_INT < 30) return null
     val app = LocalContext.current.applicationContext as UltraSlimApp
     val owner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()

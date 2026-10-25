@@ -4,7 +4,6 @@ import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
 import app.ultraslim.model.OutputFormat
 import java.io.File
@@ -47,7 +46,6 @@ object MediaStoreSaver {
         expectedFingerprint: Fingerprint? = null,
         fileModifiedTime: Long? = dateTaken,
     ): Uri? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         if (!sourceFile.isFile) return null
 
         val resolver = context.contentResolver
@@ -101,7 +99,7 @@ object MediaStoreSaver {
         }
 
         val uri = runCatching {
-            if (Build.VERSION.SDK_INT >= 30 && relatedUri != null) resolver.insert(collection, values,
+            if (relatedUri != null) resolver.insert(collection, values,
                 android.os.Bundle().apply { putParcelable(MediaStore.QUERY_ARG_RELATED_URI, relatedUri) })
             else resolver.insert(collection, values)
         }.getOrNull()
@@ -196,7 +194,7 @@ object MediaStoreSaver {
                     // FAT and some providers round mtime to whole seconds (occasionally two).
                     // A timestamp limitation must not discard an otherwise verified export.
                     val stat = android.system.Os.fstat(descriptor.fileDescriptor)
-                    val actual = stat.st_mtime * 1000 + if (Build.VERSION.SDK_INT >= 27) stat.st_mtim.tv_nsec / 1_000_000 else 0
+                    val actual = stat.st_mtime * 1000 + stat.st_mtim.tv_nsec / 1_000_000
                     if (kotlin.math.abs(actual - timestamp) > 2000)
                         android.util.Log.w("MediaStoreSaver", "Provider did not retain requested file time")
                     return@use

@@ -125,7 +125,7 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                         .then(if (railMode) Modifier.navigationBarsPadding() else Modifier)
                         .padding(horizontal = 16.dp, vertical = 8.dp)) {
                         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (pendingCount > 0 && android.os.Build.VERSION.SDK_INT >= 29) {
+                            if (pendingCount > 0) {
                                 Button(onClick = { vm.saveSelected(selectedItems.map { it.id }.toSet()) }, enabled = !state.busyNow) {
                                     Text(if (state.busyNow) "处理中…" else "保存 $pendingCount 张")
                                 }

@@ -21,9 +21,7 @@ internal fun installedVersion(context: Context): String = runCatching {
 
 /** User-initiated clipboard export; contains no image, URI, filename, location or device identifier. */
 internal fun feedbackInfo(context: Context, defaults: ConversionDefaults, nativeVersion: String): String {
-    val thermalStatus = if (Build.VERSION.SDK_INT >= 29) {
-        runCatching { context.getSystemService(PowerManager::class.java).currentThermalStatus }.getOrNull()
-    } else null
+    val thermalStatus = runCatching { context.getSystemService(PowerManager::class.java).currentThermalStatus }.getOrNull()
     return buildString {
         appendLine("UltraSlim ${installedVersion(context)}")
         appendLine("安装包：${context.packageName}")

@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -103,10 +102,9 @@ fun SettingsScreen(onBack: () -> Unit) {
             SettingItem("自动保存到相册", "保存到 UltraSlim；自动替换时存回原相册", Icons.Rounded.PhotoLibrary,
                 defaults.autoSave, vm::setAutoSave, 1, 3)
             SettingItem("校验后自动替换原图",
-                if (Build.VERSION.SDK_INT >= 30) "自动存回原相册，完成后在首页确认回收原图" else "需要 Android 11 或更新版本",
+                "自动存回原相册，完成后在首页确认回收原图",
                 Icons.Rounded.VerifiedUser, defaults.autoReplaceOriginals,
-                { if (it) confirmAutoReplace = true else vm.setAutoReplaceOriginals(false) }, 2, 3,
-                enabled = Build.VERSION.SDK_INT >= 30)
+                { if (it) confirmAutoReplace = true else vm.setAutoReplaceOriginals(false) }, 2, 3)
         }
         SettingsGroup("输出文件", "之后开始的批次采用此设置；已有批次仍保存到原定目录") {
             Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerLow) {
@@ -163,7 +161,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         onSelect = { vm.setThemeMode(modes[it]) })
                 }
             }
-            if (Build.VERSION.SDK_INT >= 31) SettingItem("动态取色", "让界面配色呼应你的壁纸", Icons.Rounded.ColorLens,
+            SettingItem("动态取色", "让界面配色呼应你的壁纸", Icons.Rounded.ColorLens,
                 theme.dynamicColor, vm::setDynamicColor, 0, 1)
         }
         SettingsGroup("存储与维护") {

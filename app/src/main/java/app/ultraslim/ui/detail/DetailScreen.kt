@@ -263,7 +263,7 @@ fun DetailScreen(historyId: Long, onBack: () -> Unit) {
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        if (!saved && android.os.Build.VERSION.SDK_INT >= 29) {
+                        if (!saved) {
                             Button(
                                 onClick = { vm.saveToAlbum() },
                                 enabled = !state.saving,

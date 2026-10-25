@@ -17,6 +17,8 @@
 
 前置：JDK 17（`/opt/homebrew/opt/openjdk@17`）、Android SDK（`~/Library/Android/sdk`，`local.properties` 指向它）、NDK 27.2.12479018、cmake + ninja（brew）。
 
+支持线 **Android 12+（`minSdk = 31`，2026-10-25 起；此前 26）**，targetSdk 36。注意：minSdk ≥ 28 起 AGP 默认把 dex 不压缩直存（供 ART mmap），26→31 时 Debug APK 实测 40→89MB——已在 `packaging` 设 `dex.useLegacyPackaging = true` 压回（APK 走 GitHub/Gitea 直链下载，体积优先；当前 Debug 39.9MB / Release 19.56MB）。动 minSdk 跨 28 边界时必须复查此开关。
+
 ```bash
 # 1. 构建原生依赖（每 ABI 一次；产物进 native/prefix/）
 native/deps/build_deps.sh android arm64-v8a ~/Library/Android/sdk/ndk/27.2.12479018 26

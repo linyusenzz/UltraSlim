@@ -1,7 +1,6 @@
 package app.ultraslim.convert
 
 import android.graphics.ImageDecoder
-import android.os.Build
 import app.ultraslim.model.OutputFormat
 import java.io.File
 import java.io.IOException
@@ -10,7 +9,7 @@ import java.io.IOException
 internal object SdrOutputValidation {
     fun requireReadable(file: File, format: OutputFormat) {
         // An external app may support formats (e.g. JXL) the platform cannot decode.
-        if (Build.VERSION.SDK_INT < 29 || !ImageDecoder.isMimeTypeSupported(format.mimeType)) return
+        if (!ImageDecoder.isMimeTypeSupported(format.mimeType)) return
         try {
             val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
