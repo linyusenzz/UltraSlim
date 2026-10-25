@@ -63,8 +63,8 @@ android {
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // 公开发行版仍沿用测试期递增的 versionCode，确保覆盖升级。
-        versionCode = 25
-        versionName = "1.0.2"
+        versionCode = 26
+        versionName = "1.0.3"
 
         // App 自身只有中文文案；剥掉 androidx/Compose 带入的其他语言资源。
         // AGP 9 起 resourceConfigurations 已弃用（Gradle 9.6 有显式警告）。
