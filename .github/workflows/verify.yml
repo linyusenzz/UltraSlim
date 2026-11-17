@@ -31,16 +31,15 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
       - name: Install Android compile tools
-        shell: bash
-        run: |
-          sdkmanager --licenses >/dev/null < <(yes)
-          sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0' \
-            'platform-tools' 'ndk;27.2.12479018' 'cmake;3.22.1'
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;27.2.12479018 cmake;3.22.1'
+          log-accepted-android-sdk-licenses: 'false'
       - name: Check repository and Python regressions
         run: |
           python3 scripts/check_repository.py
