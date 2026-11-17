@@ -1,6 +1,8 @@
 package app.ultraslim
 
+import android.content.Intent
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import androidx.test.platform.app.InstrumentationRegistry
 import app.ultraslim.convert.*
@@ -15,14 +17,29 @@ import org.junit.Assert.*
 
 class SelectedOutputTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private val authority = "app.ultraslim.tests.exports"
+    private val testPackage = InstrumentationRegistry.getInstrumentation().context.packageName
+    private val authority = "$testPackage.exports"
+    private val grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
     private val tree = DocumentsContract.buildTreeDocumentUri(authority, "root")
     private val files = mutableListOf<File>()
     private fun control(method: String, value: String? = null) {
-        context.contentResolver.call(Uri.parse("content://$authority"), method, value, null)
+        context.contentResolver.call(tree, method, value, null)
     }
-    @Before fun reset() { control("reset") }
-    @After fun clean() { control("reset"); files.forEach { ExportCheckpoint(it).delete(); it.delete() } }
+    @Before fun reset() {
+        val command = "am start -W -n $testPackage/app.ultraslim.FolderGrantActivity --es target ${context.packageName} --ez export true"
+        val fd = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        ParcelFileDescriptor.AutoCloseInputStream(fd).use { it.readBytes() }
+        context.contentResolver.takePersistableUriPermission(tree, grantFlags)
+        control("reset")
+    }
+    @After fun clean() {
+        try {
+            control("reset")
+        } finally {
+            files.forEach { ExportCheckpoint(it).delete(); it.delete() }
+            context.contentResolver.releasePersistableUriPermission(tree, grantFlags)
+        }
+    }
     private fun source() = File(context.cacheDir, UUID.randomUUID().toString()).also {
         it.writeBytes(ByteArray(180000) { n -> n.toByte() }); files += it
     }

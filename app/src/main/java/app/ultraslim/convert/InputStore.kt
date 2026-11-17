@@ -12,15 +12,15 @@ import java.io.File
 
 /** Copy only ephemeral grants. Picker/document grants and accessible MediaStore inputs remain fd based. */
 object InputStore {
-    fun persist(context: Context, uri: Uri, id: String, checkCancelled: () -> Unit = {}): Uri {
+    fun persist(context: Context, uri: Uri, id: String, hasTreeGrant: Boolean = false, checkCancelled: () -> Unit = {}): Uri {
         if (uri.scheme != "content") error("请从系统图片选择器导入")
         // A persisted tree grant already covers every child. Taking one grant per image can
         // exhaust the system grant quota and cause unnecessary copies of a large folder.
-        if (DocumentsContract.isTreeUri(uri) && context.contentResolver.persistedUriPermissions.any { grant ->
+        if (hasTreeGrant || (DocumentsContract.isTreeUri(uri) && context.contentResolver.persistedUriPermissions.any { grant ->
                 grant.isReadPermission && grant.uri.authority == uri.authority &&
                     DocumentsContract.isTreeUri(grant.uri) &&
                     DocumentsContract.getTreeDocumentId(grant.uri) == DocumentsContract.getTreeDocumentId(uri)
-            }) return uri
+            })) return uri
         if (runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }.isSuccess) return uri
         val permission = if (Build.VERSION.SDK_INT >= 33) android.Manifest.permission.READ_MEDIA_IMAGES else android.Manifest.permission.READ_EXTERNAL_STORAGE
         if (uri.authority == "media" && ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) return uri

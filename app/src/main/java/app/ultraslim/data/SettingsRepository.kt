@@ -12,7 +12,9 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import app.ultraslim.model.ConversionSettings
 import app.ultraslim.model.OutputFormat
+import app.ultraslim.ui.components.CompressionPreset
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.io.File
 
@@ -66,6 +68,7 @@ data class ConversionDefaults(
     val resizePercent: Int = 100,
     val avifGainmapCompatibility: Boolean = true,
     val heicGainmapCompatibility: Boolean = true,
+    val jxlJpegReconstruction: Boolean = false,
 ) {
     fun toConversionSettings(): ConversionSettings =
         ConversionSettings(
@@ -81,6 +84,7 @@ data class ConversionDefaults(
             resizePercent = resizePercent,
             avifGainmapCompatibility = avifGainmapCompatibility,
             heicGainmapCompatibility = heicGainmapCompatibility,
+            jxlJpegReconstruction = jxlJpegReconstruction,
         )
 }
 
@@ -107,6 +111,7 @@ class SettingsRepository(private val context: Context) {
         val RESIZE_PERCENT = intPreferencesKey("resize_percent")
         val AVIF_GAINMAP_COMPATIBILITY = booleanPreferencesKey("avif_gainmap_compatibility")
         val HEIC_GAINMAP_COMPATIBILITY = booleanPreferencesKey("heic_gainmap_compatibility")
+        val JXL_JPEG_RECONSTRUCTION = booleanPreferencesKey("jxl_jpeg_reconstruction")
     }
 
     val defaults: Flow<ConversionDefaults> = context.settingsStore().data.map { p ->
@@ -129,15 +134,16 @@ class SettingsRepository(private val context: Context) {
             resizePercent = p[Keys.RESIZE_PERCENT] ?: 100,
             avifGainmapCompatibility = p[Keys.AVIF_GAINMAP_COMPATIBILITY] ?: true,
             heicGainmapCompatibility = p[Keys.HEIC_GAINMAP_COMPATIBILITY] ?: true,
+            jxlJpegReconstruction = p[Keys.JXL_JPEG_RECONSTRUCTION] ?: false,
         )
-    }
+    }.distinctUntilChanged()
 
     val theme: Flow<ThemeSettings> = context.settingsStore().data.map { p ->
         ThemeSettings(
             themeMode = ThemeMode.fromId(p[Keys.THEME_MODE]),
             dynamicColor = p[Keys.DYNAMIC_COLOR] ?: true,
         )
-    }
+    }.distinctUntilChanged()
 
     suspend fun setOutputFormat(format: OutputFormat) {
         context.settingsStore().edit { it[Keys.OUTPUT_FORMAT] = format.extension }
@@ -216,6 +222,20 @@ class SettingsRepository(private val context: Context) {
         context.settingsStore().edit { it[Keys.AVIF_GAINMAP_COMPATIBILITY] = enabled }
     }
 
+    suspend fun setJxlJpegReconstruction(enabled: Boolean) {
+        context.settingsStore().edit { it[Keys.JXL_JPEG_RECONSTRUCTION] = enabled }
+    }
+
+    suspend fun applyPreset(preset: CompressionPreset) {
+        context.settingsStore().edit { p ->
+            p[Keys.QUALITY] = preset.quality.coerceIn(50, 100)
+            p[Keys.GAINMAP_QUALITY] = preset.gainmapQuality.coerceIn(30, 90)
+            p[Keys.GAINMAP_SCALE] = preset.gainmapScale
+            p[Keys.RESIZE_PERCENT] = preset.resizePercent.coerceIn(25, 100)
+            p[Keys.SPEED_LEVEL] = preset.speedLevel.coerceIn(0, 2)
+        }
+    }
+
     suspend fun setDefaults(d: ConversionDefaults) {
         context.settingsStore().edit { p ->
             p[Keys.OUTPUT_FORMAT] = d.format.extension
@@ -236,6 +256,7 @@ class SettingsRepository(private val context: Context) {
             p[Keys.RESIZE_PERCENT] = d.resizePercent.coerceIn(25, 100)
             p[Keys.AVIF_GAINMAP_COMPATIBILITY] = d.avifGainmapCompatibility
             p[Keys.HEIC_GAINMAP_COMPATIBILITY] = d.heicGainmapCompatibility
+            p[Keys.JXL_JPEG_RECONSTRUCTION] = d.jxlJpegReconstruction
         }
     }
 }
@@ -249,6 +270,7 @@ fun ConversionDefaults.encode(): String = org.json.JSONObject().apply {
     put("onlySmaller", onlySmaller); put("keepLocation", keepLocation)
     put("avifGainmapCompatibility", avifGainmapCompatibility)
     put("heicGainmapCompatibility", heicGainmapCompatibility)
+    put("jxlJpegReconstruction", jxlJpegReconstruction)
 }.toString()
 
 fun decodeDefaults(value: String): ConversionDefaults {
@@ -268,7 +290,18 @@ fun decodeDefaults(value: String): ConversionDefaults {
         onlySmaller = j.optBoolean("onlySmaller", d.onlySmaller), keepLocation = j.optBoolean("keepLocation", d.keepLocation),
         // Old queued jobs and history used pixel-exact encoding. Do not relabel them.
         avifGainmapCompatibility = j.optBoolean("avifGainmapCompatibility", false),
-        heicGainmapCompatibility = j.optBoolean("heicGainmapCompatibility", false))
+        heicGainmapCompatibility = j.optBoolean("heicGainmapCompatibility", false),
+        jxlJpegReconstruction = j.optBoolean("jxlJpegReconstruction", false))
 }
 
-fun ConversionDefaults.summary(): String = "${format.label} · 编码质量 $quality · ${if (resizePercent == 100) "原始尺寸" else "尺寸 $resizePercent%"} · ${if ((format == OutputFormat.AVIF && avifGainmapCompatibility) || (format == OutputFormat.HEIC && heicGainmapCompatibility)) "HDR 相册兼容" else "Gain Map 原样保留"} · ${if (autoSave) "自动保存" else "手动保存"}${if (autoReplaceOriginals) " · 校验后自动替换" else ""}"
+fun ConversionDefaults.summary(inputContainer: Int? = null): String {
+    val encoding = if (format == OutputFormat.JXL && jxlJpegReconstruction && inputContainer == 0) {
+        "JPEG 重建 · 原始尺寸"
+    } else {
+        "编码质量 $quality · " + if (resizePercent == 100) "原始尺寸" else "尺寸 $resizePercent%"
+    }
+    val compatible = (format == OutputFormat.AVIF && avifGainmapCompatibility) ||
+        (format == OutputFormat.HEIC && heicGainmapCompatibility)
+    return listOfNotNull(format.label, encoding, if (compatible) "HDR 相册兼容" else "Gain Map 原样保留",
+        if (autoSave) "自动保存" else "手动保存", "校验后自动替换".takeIf { autoReplaceOriginals }).joinToString(" · ")
+}

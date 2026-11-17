@@ -18,7 +18,7 @@ class SourceTimestampTest {
     private val capture = Instant.parse("2021-07-08T03:40:11.345Z").toEpochMilli()
     private val modified = Instant.parse("2024-02-03T04:05:06Z").toEpochMilli()
     private fun source(exif: Boolean = false, taken: Long? = null) = Uri.parse(
-        "content://app.ultraslim.tests.timestamps/${if (exif) "exif" else "plain"}.jpg?modified=$modified" +
+        "content://${InstrumentationRegistry.getInstrumentation().context.packageName}.timestamps/${if (exif) "exif" else "plain"}.jpg?modified=$modified" +
             (taken?.let { "&taken=$it" } ?: ""))
 
     @Test fun providerDateWinsAndModificationIsNeverPretendedToBeCaptureTime() {

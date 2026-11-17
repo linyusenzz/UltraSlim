@@ -62,7 +62,7 @@ internal object PreviewCache {
     suspend fun load(context: Context, uriString: String, requestedDim: Int): Bitmap? {
         val maxDim = resolutions.firstOrNull { it >= requestedDim } ?: 4096
         val version = versionOf(context, uriString) ?: return null
-        val key = cacheKey("$uriString:$version:v5", maxDim)
+        val key = cacheKey("$uriString:$version:v6", maxDim)
 
         val mem = cacheFor(maxDim)
         // 1. Fast-path: In-memory cache hit (LruCache is internally synchronized; no diskLock needed)
@@ -77,7 +77,7 @@ internal object PreviewCache {
             readCached(file, key, maxDim)?.let { return@withLock it }
             // Detail previews can supply list thumbnails without decoding the original again.
             for (dimension in resolutions.filter { it > maxDim }) {
-                val largerKey = cacheKey("$uriString:$version:v5", dimension)
+                val largerKey = cacheKey("$uriString:$version:v6", dimension)
                 val larger = cacheFor(dimension).get(largerKey)
                     ?: readCached(File(dir, "$largerKey.jpg"), largerKey, dimension, sampleTo = maxDim)
                 if (larger != null) {
@@ -90,13 +90,15 @@ internal object PreviewCache {
                 }
             }
 
-            // Only cache misses enter the encoder's native working-set lane.
-            val bytes = ImageWork.run("preview $maxDim") { decode(context, uriString, maxDim) } ?: return@withLock null
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withLock null
+            // Open FD outside ImageWork so slow provider calls never stall the native lane.
+            val stage = if (maxDim <= THUMB_MAX_DIM) "thumb $maxDim" else "preview $maxDim"
+            val bitmap = decodeBitmap(context, uriString, maxDim, stage) ?: return@withLock null
             mem.put(key, bitmap)
             synchronized(diskLock) {
                 dir.mkdirs()
-                runCatching { file.writeBytes(bytes) }
+                runCatching {
+                    file.outputStream().use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 82, out) }
+                }
                 val n = writesSinceTrim.incrementAndGet()
                 if (n == 1 || n % TRIM_INTERVAL == 0) trim(dir)
             }
@@ -115,12 +117,20 @@ internal object PreviewCache {
             val edge = maxOf(bounds.outWidth, bounds.outHeight)
             var sample = 1
             while (edge / (sample * 2) >= sampleTo) sample *= 2
-            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
+                inSampleSize = sample
+                if (sampleTo <= THUMB_MAX_DIM) inPreferredConfig = Bitmap.Config.RGB_565
+            })
+        } else if (maxDim <= THUMB_MAX_DIM) {
+            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.RGB_565
+            })
         } else {
             BitmapFactory.decodeFile(file.absolutePath)
         }
         if (bitmap == null) file.delete() else if (sampleTo <= 0) {
-            file.setLastModified(System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            if (now - file.lastModified() > 60_000L) file.setLastModified(now)
             cacheFor(maxDim).put(key, bitmap)
         }
         return bitmap
@@ -157,19 +167,21 @@ internal object PreviewCache {
         }
     }.getOrNull()
 
-    private fun decode(context: Context, uriString: String, maxDim: Int): ByteArray? = runCatching {
-        // Measure after entering ImageWork: a request may have waited behind an encode.
-        val info = ActivityManager.MemoryInfo().also {
-            context.getSystemService(ActivityManager::class.java).getMemoryInfo(it)
-        }
-        val budget = ConversionBudget.previewBytes(info.availMem, info.totalMem, info.threshold, info.lowMemory)
-        if (budget == 0L) return@runCatching null
-        if (uriString.startsWith("content://")) {
+    private suspend fun decodeBitmap(context: Context, uriString: String, maxDim: Int, stage: String): Bitmap? = runCatching {
+        val pfd = if (uriString.startsWith("content://")) {
             context.contentResolver.openFileDescriptor(Uri.parse(uriString), "r")
-                ?.use { UltraHdrBridge.nativeDecodePreview(it.fd, maxDim, budget) }
         } else {
             ParcelFileDescriptor.open(File(uriString), ParcelFileDescriptor.MODE_READ_ONLY)
-                .use { UltraHdrBridge.nativeDecodePreview(it.fd, maxDim, budget) }
+        } ?: return@runCatching null
+        pfd.use { fd ->
+            ImageWork.run(stage) {
+                // Measure after entering ImageWork: a request may have waited behind an encode.
+                val info = ActivityManager.MemoryInfo().also {
+                    context.getSystemService(ActivityManager::class.java).getMemoryInfo(it)
+                }
+                val budget = ConversionBudget.previewBytes(info.availMem, info.totalMem, info.threshold, info.lowMemory)
+                if (budget == 0L) null else UltraHdrBridge.nativeDecodePreviewBitmap(fd.fd, maxDim, budget)
+            }
         }
     }.getOrNull()
 

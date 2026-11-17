@@ -95,6 +95,25 @@
 
 验证与设备边界见 [2026-10-17 优化记录](reports/2026-10-17-optimization-batch.md) 与 AGENTS「性能批次（2026-10-25）」。
 
+## 已完成（2026-10-29 批次）
+
+- 历史页改为最多 500 条的游标窗口，查询前合并通知；跨窗口选择保留，日期删除仍跨分页。
+- 原图不可用状态增加 15 秒短期缓存，刷新/重关联使旧查询失效。
+- 转换队列增加 ID/URI 索引与 revision 脏行持久化，保持 flush 屏障；不可变列表复制成本仍在。
+- JPEG 独立 probe 改为有界缓冲扫描，复用 UHDR 元数据解析；完整转码与 HEIF/JXL 路径不变。
+- 默认关闭的分阶段性能日志、QA PSS 采样脚本、启动/导航 Macrobenchmark 与 Profile 生成模块。
+- 状态丰富的升级测试、真实进程结束恢复脚本及受信任分支 CI 工作流。
+
+主机测量和验证边界见 [2026-10-29 优化记录](reports/2026-10-29-optimization-batch.md)。设备测试和真机性能采集未完成；保留现有 Baseline Profile，不把测量设施的编译成功视为性能提升。
+
+## 已完成（2026-11-18 批次）
+
+- **JXL 保留 JPEG 码流重建（`jxlJpegReconstruction`）**：进阶参数与默认设置页在 JXL 输出下支持 `--lossless_jpeg=1 --allow_jpeg_reconstruction=1` 等价能力（SDR JPEG 与 Ultra HDR 增益图 JPEG 均支持；HDR 在 `JxlEncoderCloseFrames` 后写入 `jhgm` box；支持不重编 DCT 的原样字节保留、原地抹除 GPS IFD 与最小方向 APP1 保留；非 JPEG 自动回退常规 JXL 编码）。主机回归见 `native/host_test/jxl_reconstruction.cpp`。
+- **JXL 二次旋转缺陷修复**：移除对 `JxlDecoder` 已自动矫正方向输出的重复 `orientPixels`。
+- **原生内存峰值、SIMD 与流式读取**：单通道增益图改用 1B/px `SdrImage::gray`；`tryReuseGainMap` 交错释放解码器、主图 RGBA 与增益图缓冲；`orientPixels` 并行化，`copyNativeGainMap` 与 `resizeRgbaPlane` 增加 NEON 快路径；JPEG 预览 `pread` 流式解码，动态照片 JPEG 探测 `ftyp`/`mpvd` 早退并按 `maxInputBytes` 截断静态图读取，同时扣减 `ConversionBudget` 估算字节。
+- **预览直出 Bitmap 与保存/替换去重**：JNI `nativeDecodePreviewBitmap` 直接填充 `Bitmap`（保留 Display P3 / BT.2020 色域），JXL/兜底预览免除 JPEG 中转重解码，缩略图池采用 `RGB_565`；`openFileDescriptor` 移出 `ImageWork` 信号量；输出平台校验目标边长降为 512；`AutoReplacement` 复用平台解码校验与预取状态并 3 路并发校验，`DeferredOutputHost` 批量更新；目录导入复用 `COLUMN_SIZE` 与树权限判断；Apple Live ZIP 与 `apple-live` `HEICPairing` 改流式写出。
+- **构建与符号裁剪**：`native/CMakeLists.txt` 启用 `-Wl,--icf=safe`；依赖构建统一开启 `-ffunction-sections -fdata-sections`，`aom` 关闭未使用的解码器与高比特深度编译，修复 `x265` 覆盖 NDK 默认编译标志的问题。
+
 ## 仍未做（需独立立项）
 
 1. **#20 queryImages 物化整库 URI**：当前只在「整个图库扫描」入口使用（一次性遍历+逐张 probe），

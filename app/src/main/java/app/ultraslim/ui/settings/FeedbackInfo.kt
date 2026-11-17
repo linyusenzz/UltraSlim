@@ -31,7 +31,7 @@ internal fun feedbackInfo(context: Context, defaults: ConversionDefaults, native
         appendLine("全局默认配置（本次任务可能不同）：")
         appendLine("${defaults.format.label} / 品质 ${defaults.quality} / 速度 ${defaults.speedLevel} / 尺寸 ${defaults.resizePercent}%")
         appendLine("保留 EXIF=${defaults.keepExif}，保留 GPS=${defaults.keepLocation}，自动保存=${defaults.autoSave}")
-        appendLine("仅保留更小结果=${defaults.onlySmaller}，HEIC 兼容=${defaults.heicGainmapCompatibility}，AVIF 兼容=${defaults.avifGainmapCompatibility}")
+        appendLine("仅保留更小结果=${defaults.onlySmaller}，HEIC 兼容=${defaults.heicGainmapCompatibility}，AVIF 兼容=${defaults.avifGainmapCompatibility}，JXL 重建=${defaults.jxlJpegReconstruction}")
         append(nativeVersion)
     }
 }

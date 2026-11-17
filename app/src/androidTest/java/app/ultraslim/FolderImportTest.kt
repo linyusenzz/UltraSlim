@@ -20,7 +20,7 @@ import org.junit.Assert.*
 class FolderImportTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val app get() = instrumentation.targetContext.applicationContext as UltraSlimApp
-    private val tree = DocumentsContract.buildTreeDocumentUri("app.ultraslim.tests.documents", "root")
+    private val tree = DocumentsContract.buildTreeDocumentUri("${instrumentation.context.packageName}.documents", "root")
     private val store = ViewModelStore()
     private lateinit var vm: HomeViewModel
     private var originalIds = emptySet<String>()

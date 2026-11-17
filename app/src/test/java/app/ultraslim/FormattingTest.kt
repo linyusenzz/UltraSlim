@@ -1,5 +1,7 @@
 package app.ultraslim
 
+import app.ultraslim.data.ConversionDefaults
+import app.ultraslim.data.summary
 import app.ultraslim.model.OutputFormat
 import app.ultraslim.util.*
 import org.junit.Assert.*
@@ -70,6 +72,24 @@ class FormattingTest {
             batchIdSelector = { it.batchId },
         )
         assertEquals(2, groups.size)
+    }
+
+    @Test fun jxlReconstructionSummaryAndGroupHeadersFormatCorrectly() {
+        val jxlRecon = ConversionDefaults(format = OutputFormat.JXL, jxlJpegReconstruction = true)
+        val jpegSummary = jxlRecon.copy(resizePercent = 50).summary(inputContainer = 0)
+        assertTrue(jpegSummary.contains("JPEG 重建 · 原始尺寸"))
+        assertFalse(jpegSummary.contains("50%") || jpegSummary.contains("编码质量"))
+        val heicSummary = jxlRecon.copy(resizePercent = 50).summary(inputContainer = 1)
+        assertFalse(heicSummary.contains("JPEG 重建"))
+        assertTrue(heicSummary.contains("尺寸 50%"))
+        assertTrue(jxlRecon.toConversionSettings().jxlJpegReconstruction)
+        val avif = ConversionDefaults(format = OutputFormat.AVIF, jxlJpegReconstruction = true)
+        assertFalse(avif.summary(inputContainer = 0).contains("JPEG 重建"))
+
+        val now = 1_700_000_000_000L
+        assertTrue(formatGroupHeader(now - 10_000L, now).endsWith("· 刚刚"))
+        assertTrue(formatGroupHeader(now - 5 * 60_000L, now).endsWith("· 5 分钟前"))
+        assertTrue(formatGroupHeader(now - 24 * 3600_000L, now).startsWith("昨天 "))
     }
 
 }

@@ -106,3 +106,19 @@ Verified against the vendored v2.0.2 writer:
   concern does not apply to files we produce. Checked while investigating the
   2026-10-25 Google Photos HEIC HBM issue (see AGENTS.md); conclusion there:
   renderer-side variance, not our metadata serialization.
+
+## Selective backports (2026-11-07, full integration validation pending)
+
+Applied PR #491 (linear Apple XMP headroom), #499 (checked EXIF offsets),
+#498 (HEIF/AVIF size and decoded-plane validation), and #515 (partial gain-map
+worker startup recovery). Local codec controls, quality mapping and malformed
+tmap handling remain in place. The ISO layout rewrite is still excluded.
+
+The Windows JPEG-only core builds; focused Apple/Adobe metadata and 40 invalid
+EXIF offset cases pass. Restoring the old Apple headroom algorithm makes the
+same regression fail. HEIF/AVIF, Android and thread-failure injection have not
+been validated locally. These backports are not a completed release validation.
+
+Apple-only map normalization/export remains under investigation and is not
+enabled. Correct headroom parsing alone does not establish equivalent Apple
+and ISO HDR rendering. See [audit and validation limits](../../docs/reports/2026-11-07-libultrahdr-backports.md).

@@ -67,11 +67,36 @@ interface HistoryDao {
     fun flowPage(limit: Int, filter: String): Flow<List<HistoryEntity>> =
         if (filter.isEmpty()) flowPageAll(limit) else flowPageFiltered(limit, filter)
 
-    @Query("SELECT * FROM history ORDER BY createdAt DESC LIMIT :limit")
+    @Query("SELECT * FROM history ORDER BY createdAt DESC, id DESC LIMIT :limit")
     fun flowPageAll(limit: Int): Flow<List<HistoryEntity>>
 
-    @Query("SELECT * FROM history WHERE saveState = :filter ORDER BY createdAt DESC LIMIT :limit")
+    @Query("SELECT * FROM history WHERE saveState = :filter ORDER BY createdAt DESC, id DESC LIMIT :limit")
     fun flowPageFiltered(limit: Int, filter: String): Flow<List<HistoryEntity>>
+
+    // A bounded keyset window does not grow with the number of pages the user has visited.
+    // Include the primary key in the cursor: a batch can contain many equal timestamps.
+    @Query("SELECT * FROM history WHERE createdAt <= :beforeTime AND " +
+        "(createdAt < :beforeTime OR id < :beforeId) ORDER BY createdAt DESC, id DESC LIMIT :limit")
+    suspend fun windowAll(beforeTime: Long, beforeId: Long, limit: Int): List<HistoryEntity>
+
+    @Query("SELECT * FROM history WHERE saveState = :filter AND createdAt <= :beforeTime AND " +
+        "(createdAt < :beforeTime OR id < :beforeId) ORDER BY createdAt DESC, id DESC LIMIT :limit")
+    suspend fun windowFiltered(filter: String, beforeTime: Long, beforeId: Long, limit: Int): List<HistoryEntity>
+
+    @Query("SELECT COUNT(*) FROM history")
+    suspend fun countAll(): Int
+
+    @Query("SELECT COUNT(*) FROM history WHERE saveState = :filter")
+    suspend fun countFiltered(filter: String): Int
+
+    @Transaction
+    suspend fun window(filter: String, beforeTime: Long, beforeId: Long, limit: Int): HistoryPage {
+        val boundedLimit = limit.coerceIn(1, 500)
+        val rows = if (filter.isEmpty()) windowAll(beforeTime, beforeId, boundedLimit + 1)
+            else windowFiltered(filter, beforeTime, beforeId, boundedLimit + 1)
+        val count = if (filter.isEmpty()) countAll() else countFiltered(filter)
+        return HistoryPage(rows.take(boundedLimit), count, rows.size > boundedLimit)
+    }
 
     // Only batch settings are needed to decide whether automatic publication is pending.
     // Observe batches too, so cancellation wakes both publication and replacement review.
@@ -104,6 +129,9 @@ interface HistoryDao {
 
     @Query("SELECT * FROM history")
     suspend fun all(): List<HistoryEntity>
+
+    @Query("SELECT id FROM history")
+    suspend fun allIds(): List<Long>
 
     /** Startup cleanup only needs references, not every image's metadata. */
     @Query("SELECT id, inputUri, outputUri FROM history")
@@ -157,6 +185,8 @@ interface HistoryDao {
 }
 
 data class HistoryPaths(val id: Long, val inputUri: String, val outputUri: String)
+
+data class HistoryPage(val items: List<HistoryEntity>, val totalCount: Int, val hasMore: Boolean)
 
 data class PendingPublicationBatch(val batchId: String, val settings: String)
 

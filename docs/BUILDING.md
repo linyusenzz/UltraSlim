@@ -75,7 +75,13 @@ python3 scripts/check_apk_alignment.py /path/to/app.apk
 "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose /path/to/signed.apk
 ```
 
-GitHub Actions 工作流目前暂缓启用，仓库没有 `.github/workflows/`。保留的 Gitea 配置位于 `.gitea/workflows/`，调用 `scripts/verify.sh`，需要 macOS + Android NDK + `macos-arm64` 自托管 runner。恢复 CI 时只执行受信任的 push 和手动触发，不自动执行外部 PR 中的代码。其它托管平台可复用该脚本，需要自行配置 runner。
+## 持续集成
+
+[GitHub Actions 配置](../.github/workflows/verify.yml) 自动检查 `main`、`codex/**` 的 push，也可手动触发；不监听外部 PR。默认使用 Ubuntu hosted runner、JDK 17 和上述 SDK/NDK，运行仓库检查、Python 回归、JVM 单测及 Android 测试源码编译。此阶段不构建原生库、不安装设备，也不证明仪器化测试已经通过。
+
+手动触发并勾选 `full` 后，只有 `main` 或 `codex/**` 分支可进入完整构建。需要专用的 `[self-hosted, macOS, ARM64, ultraslim]` runner，预装本页工具、SDK Platform 37.0、Build Tools 36.0.0、NDK 27.2.12479018 和 SDK CMake 3.22.1；JDK 路径为 `/opt/homebrew/opt/openjdk@17`，SDK 路径为 `~/Library/Android/sdk`。应使用可清理的专用工作目录，不放个人签名材料。该任务从源码构建 host/Android 依赖，执行 `scripts/verify.sh` 并编译两种 benchmark APK；不缓存原生依赖产物，不运行设备测试，不签署正式发行包或发布。
+
+保留的 [Gitea 配置](../.gitea/workflows/verify.yml) 继续使用原 `macos-arm64` runner。新增 GitHub 工作流目前仅完成本地配置检查，尚未远端执行；需要实际运行后才能确认 runner 环境和在线依赖解析。性能采集、Profile 与进程恢复测试见 [性能测量说明](PERFORMANCE.md)。
 
 ## macOS 配套工具
 

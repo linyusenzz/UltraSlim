@@ -15,16 +15,23 @@ class ExifEditor {
   void put32(size_t p,uint32_t v) { if(little){put16(p,v);put16(p+2,v>>16);}else{put16(p,v>>16);put16(p+2,v);} }
   size_t ifd() const { return base + u32(base+4); }
   bool bounded(size_t p) const { return valid && p>=base+8 && p+2<=bytes.size() && p+2+size_t(u16(p))*12+4<=bytes.size(); }
-  void wipeGps(size_t p) {
-    if(!bounded(p)) return;
+  bool wipeGps(size_t p) {
+    if(!bounded(p)) return false;
     const size_t sizes[]={0,1,1,2,4,8,1,1,2,4,8,4,8};
     auto count=u16(p);
+    bool complete = true;
     for(size_t i=0;i<count;i++) {
       size_t e=p+2+i*12; auto type=u16(e+2); auto n=u32(e+4);
-      uint64_t len=type<13?uint64_t(sizes[type])*n:0;
-      if(len>4) { uint64_t start=base+uint64_t(u32(e+8)); if(start>=p+2+size_t(count)*12+4 && start+len<=bytes.size()) std::fill(bytes.begin()+start,bytes.begin()+start+len,0); }
+      if(type==0 || type>=13) { complete = false; continue; }
+      uint64_t len=uint64_t(sizes[type])*n;
+      if(len>4) {
+        uint64_t start=base+uint64_t(u32(e+8));
+        if(start<p+2+size_t(count)*12+4 || start+len>bytes.size()) { complete = false; continue; }
+        std::fill(bytes.begin()+start,bytes.begin()+start+len,0);
+      }
     }
     std::fill(bytes.begin()+p,bytes.begin()+p+2+count*12+4,0);
+    return complete;
   }
  public:
   explicit ExifEditor(std::vector<uint8_t>& b):bytes(b) {
@@ -36,6 +43,26 @@ class ExifEditor {
     auto p=ifd(); if(!bounded(p))return 1;
     for(int i=0;i<u16(p);i++){size_t e=p+2+i*12;if(u16(e)==0x112&&u16(e+2)==3&&u32(e+4)==1){int v=u16(e+8);return v>=1&&v<=8?v:1;}}
     return 1;
+  }
+  bool hasGps() const {
+    auto p=ifd(); if(!bounded(p))return false;
+    for(int i=0;i<u16(p);i++){if(u16(p+2+i*12)==0x8825) return true;}
+    return false;
+  }
+  bool stripGpsOnly() {
+    auto p=ifd(); if(!bounded(p))return false;
+    bool stripped=false;
+    for(int i=0;i<u16(p);i++) {
+      size_t e=p+2+i*12;
+      if(u16(e)==0x8825) {
+        const auto n=u16(p); const uint64_t gps=base+uint64_t(u32(e+8));
+        if(gps<p+2+size_t(n)*12+4 || gps>=bytes.size() || !wipeGps(size_t(gps))) return false;
+        std::move(bytes.begin()+e+12,bytes.begin()+p+2+n*12+4,bytes.begin()+e);
+        std::fill(bytes.begin()+p+2+(n-1)*12+4,bytes.begin()+p+2+n*12+4,0);
+        put16(p,n-1);--i;stripped=true;
+      }
+    }
+    return stripped;
   }
   void normalize(int width,int height,bool keepLocation,int orientation = 1) {
     auto p=ifd(); if(!bounded(p))return;

@@ -34,13 +34,19 @@ internal fun DeferredOutputHost() {
                         if (page.isEmpty()) break
                         afterCreatedAt = page.last().createdAt
                         afterId = page.last().id
+                        // 同一批次设置按页缓存。
+                        val batchCache = HashMap<String, Pair<app.ultraslim.data.BatchEntity, app.ultraslim.data.ConversionDefaults>?>()
                         for (row in page) {
-                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
-                            val batch = app.database.taskDao().batch(row.batchId) ?: continue
-                            val options = runCatching { decodeDefaults(batch.settings) }.getOrNull() ?: continue
+                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) break
+                            val pair = batchCache.getOrPut(row.batchId) {
+                                val b = app.database.taskDao().batch(row.batchId) ?: return@getOrPut null
+                                val o = runCatching { decodeDefaults(b.settings) }.getOrNull() ?: return@getOrPut null
+                                b to o
+                            } ?: continue
+                            val (batch, options) = pair
                             if (batch.cancelled || !options.autoSave) continue
                             // Recheck after the suspend batch lookup, immediately before saving.
-                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
+                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) break
                             try {
                                 OutputStore.save(app, row)
                             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -52,6 +58,7 @@ internal fun DeferredOutputHost() {
                                 }
                             }
                         }
+                        if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
                     }
                 }
             } finally { app.galleryPublicationRunning.value = false }

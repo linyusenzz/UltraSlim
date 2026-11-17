@@ -47,15 +47,29 @@ internal object ImageWork {
         } catch (_: Exception) { file.failWrite(stream) }
     }
 
-    suspend fun <T> run(stage: String = "probe", block: () -> T): T = withContext(dispatcher) {
-        // 扫描只每 5 秒持久化一对 probe 记录；编码/预览和失败仍逐次记录。
-        val now = android.os.SystemClock.elapsedRealtime()
-        val traceJob = stage != "probe" || lastProbeTraceAt?.let { now - it >= PROBE_TRACE_INTERVAL_MS } != false
-        if (traceJob) {
-            if (stage == "probe") lastProbeTraceAt = now
-            record(stage, "started")
+    suspend fun <T> run(stage: String = "probe", block: () -> T): T {
+        val measuring = android.util.Log.isLoggable(ConversionPerformance.TAG, android.util.Log.DEBUG)
+        val queuedAt = if (measuring) System.nanoTime() else 0L
+        return withContext(dispatcher) {
+            val enteredAt = if (measuring) System.nanoTime() else 0L
+            // 扫描与列表小缩略图只每 5 秒持久化一对记录；编码/大图预览和失败仍逐次记录。
+            val now = android.os.SystemClock.elapsedRealtime()
+            val sampled = stage == "probe" || stage.startsWith("thumb")
+            val traceJob = !sampled || lastProbeTraceAt?.let { now - it >= PROBE_TRACE_INTERVAL_MS } != false
+            if (traceJob) {
+                if (sampled) lastProbeTraceAt = now
+                record(stage, "started")
+            }
+            try { block().also { if (traceJob) record(stage, "completed") } }
+            catch (e: Throwable) { record(stage, "failed"); throw e }
+            finally {
+                if (measuring) runCatching {
+                    android.util.Log.i(ConversionPerformance.TAG, org.json.JSONObject()
+                        .put("event", "image_work").put("version", 1).put("stage", stage)
+                        .put("waitMs", (enteredAt - queuedAt) / 1_000_000.0)
+                        .put("laneMs", (System.nanoTime() - enteredAt) / 1_000_000.0).toString())
+                }
+            }
         }
-        try { block().also { if (traceJob) record(stage, "completed") } }
-        catch (e: Throwable) { record(stage, "failed"); throw e }
     }
 }

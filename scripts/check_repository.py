@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 GENERATED = {".git", ".gradle", ".kotlin", ".idea", ".codex", ".zcode", "__pycache__"}
-GENERATED_PATHS = ("build/", "app/build/", "native/prefix/", "native/deps/build/",
+GENERATED_PATHS = ("build/", "app/build/", "benchmark/build/", "native/prefix/", "native/deps/build/",
                    "apple-live/.build/", "apple-live/dist/")
 
 

@@ -9,11 +9,18 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 
 /** Stream document URIs: do not materialize all files or recursively keep directory cursors open. */
 object FolderImages {
+    data class Entry(val uri: Uri, val displayName: String?, val sizeBytes: Long)
+
     fun images(resolver: ContentResolver, tree: Uri, recursive: Boolean,
-        onUnreadableDirectory: () -> Unit = {}): Flow<Uri> = flow {
+        onUnreadableDirectory: () -> Unit = {}): Flow<Uri> =
+        entries(resolver, tree, recursive, onUnreadableDirectory).map { it.uri }
+
+    fun entries(resolver: ContentResolver, tree: Uri, recursive: Boolean,
+        onUnreadableDirectory: () -> Unit = {}): Flow<Entry> = flow {
         val root = DocumentsContract.getTreeDocumentId(tree)
         val pending = ArrayDeque<String>().apply { add(root) }
         val visited = HashSet<String>()
@@ -29,6 +36,7 @@ object FolderImages {
                     DocumentsContract.Document.COLUMN_MIME_TYPE,
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                     DocumentsContract.Document.COLUMN_FLAGS,
+                    DocumentsContract.Document.COLUMN_SIZE,
                 ), null, null, null) ?: error("无法读取文件夹")
             } catch (e: Exception) {
                 currentCoroutineContext().ensureActive()
@@ -41,15 +49,18 @@ object FolderImages {
                 val mimeColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 val nameColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val flagsColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS)
+                val sizeColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
                 while (it.moveToNext()) {
                     currentCoroutineContext().ensureActive()
                     val id = it.getString(idColumn) ?: continue
                     val mime = it.getString(mimeColumn)
+                    val name = it.getString(nameColumn)
                     if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
                         if (recursive && id !in visited) pending.add(id)
                     } else if (it.getInt(flagsColumn) and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT == 0 &&
-                        supported(mime, it.getString(nameColumn))) {
-                        emit(DocumentsContract.buildDocumentUriUsingTree(tree, id))
+                        supported(mime, name)) {
+                        val size = if (sizeColumn >= 0 && !it.isNull(sizeColumn)) it.getLong(sizeColumn) else 0L
+                        emit(Entry(DocumentsContract.buildDocumentUriUsingTree(tree, id), name, size))
                     }
                 }
             }

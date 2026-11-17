@@ -101,6 +101,48 @@ class HistoryRepositoryTest {
         assertEquals(HistoryStats(), dao.stats())
     }
 
+    @Test fun historyWindowsBoundRowsAndKeepSameTimestampCursorsStableAfterWrites() = runBlocking {
+        val dao = database.historyDao()
+        repeat(1_203) { index -> dao.insert(row(index.toLong() + 1).copy(createdAt = 1234)) }
+        val first = dao.window("", Long.MAX_VALUE, Long.MAX_VALUE, Int.MAX_VALUE)
+        assertEquals(500, first.items.size)
+        assertEquals((1_203L downTo 704L).toList(), first.items.map { it.id })
+        assertTrue(first.hasMore)
+        assertEquals(1_203, first.totalCount)
+        val boundary = first.items.last()
+        // New rows and deletions above the cursor must not shift the next page. Deleting
+        // the anchor itself must not make its position unusable either.
+        dao.insert(row(1_204).copy(createdAt = 1235))
+        dao.deleteByIds(listOf(1_203L, 1_202L, boundary.id))
+        dao.update(dao.byId(703)!!.copy(saveState = "FAILED", inputUri = "relinked"))
+        val second = dao.window("", boundary.createdAt, boundary.id, 500)
+        assertEquals((703L downTo 204L).toList(), second.items.map { it.id })
+        assertEquals("relinked", second.items.first().inputUri)
+        assertTrue(second.hasMore)
+        val last = second.items.last()
+        val third = dao.window("", last.createdAt, last.id, 500)
+        assertEquals((203L downTo 1L).toList(), third.items.map { it.id })
+        assertFalse(third.hasMore)
+        assertEquals(1_201, third.totalCount)
+        assertEquals(1_200, dao.inDateRange(1234, 1235).size)
+    }
+
+    @Test fun filteredHistoryWindowsReflectPublicationAndDeletionWithoutSkippingOlderRows() = runBlocking {
+        val dao = database.historyDao()
+        repeat(210) { dao.insert(row(it.toLong() + 1, saveState = "PENDING").copy(createdAt = 100)) }
+        val first = dao.window("PENDING", Long.MAX_VALUE, Long.MAX_VALUE, 100)
+        assertEquals((210L downTo 111L).toList(), first.items.map { it.id })
+        val anchor = first.items.last()
+        first.items.forEach { dao.update(it.copy(saveState = "SAVED")) }
+        dao.deleteById(110)
+        val next = dao.window("PENDING", anchor.createdAt, anchor.id, 100)
+        assertEquals((109L downTo 10L).toList(), next.items.map { it.id })
+        assertEquals(109, next.totalCount)
+        assertTrue(next.hasMore)
+        assertEquals(100, dao.window("SAVED", Long.MAX_VALUE, Long.MAX_VALUE, 100).items.size)
+        assertTrue(dao.window("missing", Long.MAX_VALUE, Long.MAX_VALUE, 100).items.isEmpty())
+    }
+
     @Test fun startupPathsAndConditionalPromotionPreserveConcurrentPublication() = runBlocking {
         val dao = database.historyDao()
         val original = row(1).copy(inputUri = "input", outputUri = "cache/output", settingsSummary = "keep")

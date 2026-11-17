@@ -13,7 +13,7 @@ TC="$NDK/toolchains/llvm/prebuilt/$(uname -s | tr '[:upper:]' '[:lower:]')-x86_6
 # survives the spaces in this repository's path.
 PREFIX_ARG=""
 if [ -n "$BUILD_ROOT" ]; then
-  PREFIX_ARG="'-ffile-prefix-map=$BUILD_ROOT=/ultraslim-deps'"
+  PREFIX_ARG=", '-ffile-prefix-map=$BUILD_ROOT=/ultraslim-deps'"
 fi
 cat > "$OUT" <<EOF
 [binaries]
@@ -32,6 +32,6 @@ endian = 'little'
 needs_exe_wrapper = true
 
 [built-in options]
-c_args = ['-fPIC', $PREFIX_ARG]
-cpp_args = ['-fPIC', $PREFIX_ARG]
+c_args = ['-fPIC', '-ffunction-sections', '-fdata-sections'$PREFIX_ARG]
+cpp_args = ['-fPIC', '-ffunction-sections', '-fdata-sections'$PREFIX_ARG]
 EOF

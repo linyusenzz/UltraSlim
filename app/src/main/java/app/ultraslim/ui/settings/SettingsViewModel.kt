@@ -59,16 +59,13 @@ class SettingsViewModel(private val app: UltraSlimApp) : ViewModel() {
     fun setKeepLocation(v: Boolean) = viewModelScope.launch { repo.setKeepLocation(v) }
     fun setAvifGainmapCompatibility(v: Boolean) = viewModelScope.launch { repo.setAvifGainmapCompatibility(v) }
     fun setHeicGainmapCompatibility(v: Boolean) = viewModelScope.launch { repo.setHeicGainmapCompatibility(v) }
+    fun setJxlJpegReconstruction(v: Boolean) = viewModelScope.launch { repo.setJxlJpegReconstruction(v) }
 
     fun setSpeedLevel(level: Int) = viewModelScope.launch { repo.setSpeedLevel(level) }
 
     fun setResizePercent(percent: Int) = viewModelScope.launch { repo.setResizePercent(percent) }
 
     fun applyPreset(preset: CompressionPreset) = viewModelScope.launch {
-        repo.setQuality(preset.quality)
-        repo.setGainmapQuality(preset.gainmapQuality)
-        repo.setGainmapScale(preset.gainmapScale)
-        repo.setResizePercent(preset.resizePercent)
-        repo.setSpeedLevel(preset.speedLevel)
+        repo.applyPreset(preset)
     }
 }

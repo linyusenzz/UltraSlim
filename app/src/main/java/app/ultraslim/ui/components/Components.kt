@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
@@ -67,6 +68,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -362,6 +364,7 @@ class OptionsCallbacks(
     val onKeepLocationChange: (Boolean) -> Unit = {},
     val onAvifGainmapCompatibilityChange: (Boolean) -> Unit = {},
     val onHeicGainmapCompatibilityChange: (Boolean) -> Unit = {},
+    val onJxlJpegReconstructionChange: (Boolean) -> Unit = {},
     val onSaveAsDefault: (() -> Unit)? = null,
     val onResetToDefault: (() -> Unit)? = null,
 )
@@ -434,7 +437,8 @@ fun SchemeCapsuleBar(
                     contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
                 BadgeChip(
-                    text = activePreset?.label ?: "品质 ${defaults.quality}",
+                    text = if (defaults.format == OutputFormat.JXL && defaults.jxlJpegReconstruction) "JPEG 重建"
+                        else activePreset?.label ?: "品质 ${defaults.quality}",
                     containerColor = MaterialTheme.colorScheme.secondaryContainer,
                     contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
@@ -646,6 +650,16 @@ fun ConversionOptionsPanel(
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
 
+                    if (defaults.format == OutputFormat.JXL) {
+                        SwitchRow(
+                            title = "保留 JPEG 重建能力",
+                            hint = "JPEG 主图保留原始尺寸，可还原经隐私设置处理后的主图 JPEG。关闭保留位置时也会移除 XMP 与 IPTC。其他输入按常规参数编码。",
+                            checked = defaults.jxlJpegReconstruction,
+                            onCheckedChange = callbacks.onJxlJpegReconstructionChange,
+                            enabled = enabled,
+                        )
+                    }
+
                     SwitchRow(
                         title = "保留 EXIF 信息",
                         hint = "保留拍摄器材、曝光参数、时间等",
@@ -755,7 +769,9 @@ fun UltraAsyncImage(
     forceSdr: Boolean = false,
 ) {
     val context = LocalContext.current
-    var useNative by remember(uriString, forceSdr) { mutableStateOf(forceSdr) }
+    var useNative by remember(uriString, forceSdr) {
+        mutableStateOf(forceSdr || uriString.endsWith(".jxl", ignoreCase = true))
+    }
     if (!useNative) {
         AsyncImage(
             model = ImageRequest.Builder(context)
@@ -784,7 +800,12 @@ fun UltraAsyncImage(
         Crossfade(targetState = state, animationSpec = tween(Motion.Fast), label = "nativeImage") { s ->
             Box(modifier = modifier, contentAlignment = Alignment.Center) {
                 when (s) {
-                    is NativeDecoded.Ready -> AsyncImage(model = s.bitmap, contentDescription = contentDescription, contentScale = contentScale, modifier = Modifier.fillMaxSize())
+                    is NativeDecoded.Ready -> Image(
+                        bitmap = remember(s.bitmap) { s.bitmap.asImageBitmap() },
+                        contentDescription = contentDescription,
+                        contentScale = contentScale,
+                        modifier = Modifier.fillMaxSize(),
+                    )
                     NativeDecoded.Loading -> CircularProgressIndicator(Modifier.size(24.dp))
                     NativeDecoded.Failed -> BoxWithConstraints(Modifier.fillMaxSize()) {
                         ImageFallbackPlaceholder()

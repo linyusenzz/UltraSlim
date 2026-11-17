@@ -32,7 +32,7 @@ object MotionPhotoHelper {
         val temp = File.createTempFile(outputFile.name, ".motion.tmp", outputFile.parentFile)
         try {
             if (targetFormat != OutputFormat.JPEG) {
-                FileInputStream(outputFile).use { input -> temp.outputStream().use { input.copyTo(it) } }
+                FileInputStream(outputFile).use { input -> temp.outputStream().use { input.copyTo(it, 128 * 1024) } }
             } else {
                 temp.writeBytes(MotionPhotoContainer.jpegWithXmp(outputFile.readBytes(), info))
             }

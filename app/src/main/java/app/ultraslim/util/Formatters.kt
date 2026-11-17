@@ -1,11 +1,17 @@
 package app.ultraslim.util
 
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Date
+import androidx.compose.runtime.Immutable
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+
+private val DATE_ONLY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy年M月d日", Locale.getDefault())
+private val TIME_ONLY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm", Locale.getDefault())
+private val MONTH_DAY_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("M月d日 HH:mm", Locale.getDefault())
+private val FULL_DATE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm", Locale.getDefault())
 
 /** "4.7 MB" / "512 KB" / "980 B" */
 fun formatBytes(bytes: Long): String {
@@ -60,13 +66,14 @@ fun formatRelativeTime(timeMs: Long, nowMs: Long = System.currentTimeMillis()): 
         diff < hour -> "${diff / minute} 分钟前"
         diff < day -> "${diff / hour} 小时前"
         diff < 7 * day -> "${diff / day} 天前"
-        else -> SimpleDateFormat("yyyy年M月d日", Locale.getDefault()).format(Date(timeMs))
+        else -> Instant.ofEpochMilli(timeMs).atZone(ZoneId.systemDefault()).format(DATE_ONLY_FORMAT)
     }
 }
 
 fun formatByteDelta(bytes: Long): String = (if (bytes > 0) "+" else if (bytes < 0) "−" else "") + formatBytes(kotlin.math.abs(bytes))
 
 /** 表示一个时间戳或批次归类的分组集合 */
+@Immutable
 data class TimeGroup<T>(
     val key: String,
     val timestamp: Long,
@@ -83,17 +90,14 @@ data class TimeGroup<T>(
  */
 fun formatGroupHeader(timeMs: Long, nowMs: Long = System.currentTimeMillis()): String {
     if (timeMs <= 0L) return "历史批次"
-    val date = Date(timeMs)
-    val now = Date(nowMs)
-    val calItem = Calendar.getInstance().apply { time = date }
-    val calNow = Calendar.getInstance().apply { time = now }
+    val zone = ZoneId.systemDefault()
+    val zdtItem = Instant.ofEpochMilli(timeMs).atZone(zone)
+    val zdtNow = Instant.ofEpochMilli(nowMs).atZone(zone)
+    val itemDate = zdtItem.toLocalDate()
+    val nowDate = zdtNow.toLocalDate()
+    val timeStr = zdtItem.format(TIME_ONLY_FORMAT)
 
-    val isSameDay = calItem.get(Calendar.YEAR) == calNow.get(Calendar.YEAR) &&
-        calItem.get(Calendar.DAY_OF_YEAR) == calNow.get(Calendar.DAY_OF_YEAR)
-
-    val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
-
-    if (isSameDay) {
+    if (itemDate == nowDate) {
         val diff = (nowMs - timeMs).coerceAtLeast(0L)
         val rel = when {
             diff < 60_000L -> "刚刚"
@@ -103,17 +107,14 @@ fun formatGroupHeader(timeMs: Long, nowMs: Long = System.currentTimeMillis()): S
         return if (rel != null) "今天 $timeStr · $rel" else "今天 $timeStr"
     }
 
-    calNow.add(Calendar.DAY_OF_YEAR, -1)
-    val isYesterday = calItem.get(Calendar.YEAR) == calNow.get(Calendar.YEAR) &&
-        calItem.get(Calendar.DAY_OF_YEAR) == calNow.get(Calendar.DAY_OF_YEAR)
-    if (isYesterday) {
+    if (itemDate == nowDate.minusDays(1)) {
         return "昨天 $timeStr"
     }
 
-    return if (calItem.get(Calendar.YEAR) == Calendar.getInstance().get(Calendar.YEAR)) {
-        SimpleDateFormat("M月d日 HH:mm", Locale.getDefault()).format(date)
+    return if (itemDate.year == nowDate.year) {
+        zdtItem.format(MONTH_DAY_TIME_FORMAT)
     } else {
-        SimpleDateFormat("yyyy年M月d日 HH:mm", Locale.getDefault()).format(date)
+        zdtItem.format(FULL_DATE_TIME_FORMAT)
     }
 }
 

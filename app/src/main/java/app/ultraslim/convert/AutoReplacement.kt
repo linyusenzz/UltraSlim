@@ -22,9 +22,9 @@ internal object AutoReplacement {
      * 而批量规模可达 2000 行，逐行重复 DataStore/provider 往返是这一轮的主要固定开销。
      */
     internal class Pass(private val app: UltraSlimApp) {
-        private var enabled: Boolean? = null
-        private val batchCancelled = HashMap<String, Boolean?>()
-        private val originalStates = HashMap<String, MediaStoreTrashHelper.OriginalState>()
+        @Volatile private var enabled: Boolean? = null
+        private val batchActiveMap = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        private val originalStates = java.util.concurrent.ConcurrentHashMap<String, MediaStoreTrashHelper.OriginalState>()
 
         suspend fun autoReplaceEnabled(): Boolean {
             enabled?.let { return it }
@@ -35,10 +35,18 @@ internal object AutoReplacement {
 
         /** null 表示批次不存在；与 batch(...)?.cancelled == false 的语义一致。 */
         suspend fun batchActive(batchId: String): Boolean {
-            if (!batchCancelled.containsKey(batchId)) {
-                batchCancelled[batchId] = app.database.taskDao().batch(batchId)?.cancelled
+            batchActiveMap[batchId]?.let { return it }
+            val active = app.database.taskDao().batch(batchId)?.cancelled == false
+            batchActiveMap[batchId] = active
+            return active
+        }
+
+        fun prefetchOriginalStates(uris: Collection<Uri>) {
+            val missing = uris.filter { !originalStates.containsKey(it.toString()) }.distinct()
+            if (missing.isEmpty()) return
+            MediaStoreTrashHelper.originalStates(app, missing).forEach { (u, st) ->
+                originalStates[u.toString()] = st
             }
-            return batchCancelled[batchId] == false
         }
 
         suspend fun originalState(uri: Uri): MediaStoreTrashHelper.OriginalState {
@@ -74,7 +82,8 @@ internal object AutoReplacement {
             check((info.size.width == history.width && info.size.height == history.height) ||
                 (info.size.width == history.height && info.size.height == history.width)) { "系统解码尺寸不一致" }
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            decoder.setTargetSampleSize(maxOf(1, (maxOf(info.size.width, info.size.height) + 1599) / 1600))
+            if (!history.hadGainMap) decoder.memorySizePolicy = ImageDecoder.MEMORY_POLICY_LOW_RAM
+            decoder.setTargetSampleSize(maxOf(1, (maxOf(info.size.width, info.size.height) + 511) / 512))
             decoder.setOnPartialImageListener { false }
         }
         try {
@@ -106,6 +115,7 @@ internal object AutoReplacement {
         outputFingerprint: MediaStoreSaver.Fingerprint? = null,
         knownMotion: MotionPhotoInfo? = null,
         hasKnownMotion: Boolean = false,
+        platformValidated: Boolean = false,
     ) = withContext(Dispatchers.IO) {
         try {
             check(app.settingsRepository.defaults.first().autoReplaceOriginals) { "自动替换已关闭" }
@@ -120,7 +130,7 @@ internal object AutoReplacement {
             val targetHash = if (target == source) sourceHash else fingerprint(app, target)
             check(sourceHash == originalHash && targetHash == originalHash) { "原图已发生变化" }
             val output = Uri.fromFile(File(history.outputUri))
-            requireReadable(app, output, history)
+            if (!platformValidated) requireReadable(app, output, history)
             val motion = if (hasKnownMotion) knownMotion else MotionPhotoHelper.detect(app, source)
             if (motion != null) {
                 val savedMotion = MotionPhotoHelper.detect(app, output) ?: error("成品未保留实况视频")
@@ -146,8 +156,8 @@ internal object AutoReplacement {
         val ready = item.copy(outputUri = history.outputUri, state = "READY")
         try {
             // 原图哈希在 stage 刚校验过，相册副本哈希在 MediaStoreSaver.save 发布时刚校验过；
-            // 真正移入回收站前 validate 仍会全量复核原图与成品哈希。
-            validate(app, ready, recheckSource = false, recheckOutput = !outputVerified)
+            // 真正移入回收站前 validate 仍会全量复核原图与成品哈希及平台解码。
+            validate(app, ready, recheckSource = false, recheckOutput = !outputVerified, recheckReadable = !outputVerified)
             app.database.replacementDao().update(ready)
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
             finish(app, listOf(item), "SKIPPED", "原图保留：${e.message ?: "保存校验失败"}")
@@ -156,7 +166,7 @@ internal object AutoReplacement {
 
     /** Rechecked immediately before requesting trash: files/permissions/settings can change while queued. */
     suspend fun validate(app: UltraSlimApp, item: ReplacementEntity, recheckSource: Boolean = true,
-                         pass: Pass? = null, recheckOutput: Boolean = true) = withContext(Dispatchers.IO) {
+                         pass: Pass? = null, recheckOutput: Boolean = true, recheckReadable: Boolean = true) = withContext(Dispatchers.IO) {
         val enabled = pass?.autoReplaceEnabled() ?: app.settingsRepository.defaults.first().autoReplaceOriginals
         check(enabled) { "自动替换已关闭" }
         val batchActive = pass?.batchActive(item.batchId) ?: (app.database.taskDao().batch(item.batchId)?.cancelled == false)
@@ -173,7 +183,9 @@ internal object AutoReplacement {
         if (recheckOutput) {
             check(fingerprint(app, Uri.parse(item.outputUri)) == item.outputHash) { "成品已变化或不可访问" }
         }
-        requireReadable(app, Uri.parse(item.outputUri), history)
+        if (recheckReadable) {
+            requireReadable(app, Uri.parse(item.outputUri), history)
+        }
         restoreOriginalAlbum(app, item)
     }
 
