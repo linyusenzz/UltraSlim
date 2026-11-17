@@ -97,7 +97,7 @@ internal class ConversionRunner(
         }
         var done = 0; var saved = 0L
         var thermalAttempt = runAttemptCount
-        val started = System.currentTimeMillis()
+        val started = android.os.SystemClock.elapsedRealtime()
         try {
             for ((index, id) in ids.withIndex()) {
                 currentCoroutineContext().ensureActive()
@@ -121,7 +121,7 @@ internal class ConversionRunner(
                 // A later hot period gets its own bounded wait, even within one batch.
                 thermalAttempt = 0
                 app.conversionThermalState.value = null
-                val elapsedSec = (System.currentTimeMillis() - started) / 1000.0
+                val elapsedSec = (android.os.SystemClock.elapsedRealtime() - started) / 1000.0
                 val speedText = if (done > 0 && elapsedSec > 0.5) {
                     val rate = done / elapsedSec
                     val remaining = ids.size - index
@@ -131,14 +131,21 @@ internal class ConversionRunner(
                 val detailText = if (saved > 0) "已省 ${formatBytes(saved)}$speedText" else "当前图片完成后可停止$speedText"
                 setForeground(createForegroundInfo(index * 100 / ids.size.coerceAtLeast(1), "正在转换 ${index + 1}/${ids.size}", detailText, false))
                 if (repo.claim(id, batchId) == null) continue
-                repo.flush()
+                val performance = ConversionPerformance(options.format.name, status)
+                try {
+                    performance.measure("claim_checkpoint") { repo.flush() }
+                } catch (e: Exception) {
+                    performance.finish(if (e is CancellationException) "INTERRUPTED" else "CLAIM_CHECKPOINT_FAILED", ::currentThermalStatus)
+                    throw e
+                }
                 try {
                     var existing = app.database.historyDao().byTask(id)
                     if (existing != null) {
                         var verifiedSave = false
                         if (options.autoSave && app.database.taskDao().batch(batchId)?.cancelled == false &&
                             app.galleryPublishingAllowed.value) {
-                            existing = OutputStore.save(app, existing)
+                            val recoveredInput = existing
+                            existing = performance.measure("publish_recovered") { OutputStore.save(app, recoveredInput) }
                             verifiedSave = existing.saveState == "SAVED"
                         }
                         if (options.autoReplaceOriginals) AutoReplacement.saved(app, existing, outputVerified = verifiedSave)
@@ -148,54 +155,71 @@ internal class ConversionRunner(
                         continue
                     }
                     val source = Uri.parse(item.uri)
-                    val originalHash = if (options.autoReplaceOriginals) withContext(Dispatchers.IO) {
+                    val originalHash = if (options.autoReplaceOriginals) performance.measure("source_fingerprint") { withContext(Dispatchers.IO) {
                         runCatching { AutoReplacement.fingerprint(app, source) }.getOrNull()
-                    } else null
+                    } } else null
                     // 队列可跨重启保留，原 URI 的内容可能已被相册编辑；预算与输出校验必须使用当前元数据。
-                    val probe = ImageWork.run {
-                        app.contentResolver.openFileDescriptor(source, "r")?.use { UltraHdrBridge.nativeProbe(it.fd) }
+                    val probe = performance.measure("input_probe") {
+                        withContext(Dispatchers.IO) { app.contentResolver.openFileDescriptor(source, "r") }?.use { pfd ->
+                            ImageWork.run { UltraHdrBridge.nativeProbe(pfd.fd) }
+                        }
                     } ?: error("无法读取原图，请重新选择或授权")
                     check(probe.isSuccess) { probe.error }
                     if (item.probe != probe) repo.update(id) { it.copy(probe = probe) }
                     if (!probe.hasGainMap && !options.allowSdr) {
                         repo.update(id) { it.copy(status = QueueStatus.SKIPPED, error = "按设置跳过 SDR 图片") }; continue
                     }
-                    val motionInfo = withContext(Dispatchers.IO) { MotionPhotoHelper.detect(app, source) }
+                    val motionInfo = performance.measure("motion_detect") {
+                        withContext(Dispatchers.IO) { MotionPhotoHelper.detect(app, source) }
+                    }
                     val motionXmp = if (motionInfo != null && options.format == OutputFormat.HEIC)
                         MotionPhotoContainer.xmp(motionInfo, options.format.mimeType) else null
+                    // JPEG 实况照片的视频段紧随静态图末尾，原生层只读前段静态图即可，免掉把数十 MB 视频读入堆并误触内存准入限制。
+                    val stillInputBytes = if (probe.container == 0 && motionInfo != null && motionInfo.videoOffset > 0L)
+                        motionInfo.videoOffset else 0L
+                    val budgetInputBytes = if (stillInputBytes > 0L) stillInputBytes
+                        else item.sizeBytes.coerceAtLeast(0L)
 
                     val file = File(app.filesDir, "outputs/$id.${options.format.extension}").apply { parentFile?.mkdirs() }
-                    suspend fun transcode(quality: Int) = ImageWork.run("encode ${options.format} ${probe.width}x${probe.height}") {
-                        val mem = ActivityManager.MemoryInfo().also { app.getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
-                        check(ConversionBudget.canStart(probe.width, probe.height, probe.gainmapWidth, probe.gainmapHeight,
-                            probe.hasGainMap, item.sizeBytes, mem.availMem, mem.totalMem, mem.threshold, mem.lowMemory)) {
-                            "可用内存不足以安全处理这张照片，已保留原图；请稍后重试"
-                        }
-                        val threads = ConversionBudget.threads(Runtime.getRuntime().availableProcessors())
-                        android.util.Log.i("UltraSlimConversion", "encode format=${options.format} size=${probe.width}x${probe.height} threads=$threads available=${mem.availMem}")
+                    suspend fun transcode(quality: Int) = withContext(Dispatchers.IO) {
                         app.contentResolver.openFileDescriptor(source, "r")!!.use { input ->
                             ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE).use { output ->
-                                UltraHdrBridge.nativeTranscode(input.fd, output.fd, options.format.codecId, quality,
-                                    options.gainmapQuality, options.gainmapScale, options.multiChannelGainmap, options.keepExif,
-                                    options.allowSdr, options.speedLevel, options.resizePercent,
-                                    threads, options.keepLocation, motionXmp, options.onlySmaller,
-                                    avifGainmapCompatibility = options.avifGainmapCompatibility,
-                                    heicGainmapCompatibility = options.heicGainmapCompatibility)
+                                ImageWork.run("encode ${options.format} ${probe.width}x${probe.height}") {
+                                    val mem = ActivityManager.MemoryInfo().also { app.getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
+                                    check(ConversionBudget.canStart(probe.width, probe.height, probe.gainmapWidth, probe.gainmapHeight,
+                                        probe.hasGainMap, budgetInputBytes, mem.availMem, mem.totalMem, mem.threshold, mem.lowMemory)) {
+                                        "可用内存不足以安全处理这张照片，已保留原图；请稍后重试"
+                                    }
+                                    val threads = ConversionBudget.threads(Runtime.getRuntime().availableProcessors())
+                                    android.util.Log.i("UltraSlimConversion", "encode format=${options.format} size=${probe.width}x${probe.height} threads=$threads available=${mem.availMem}")
+                                    UltraHdrBridge.nativeTranscode(input.fd, output.fd, options.format.codecId, quality,
+                                        options.gainmapQuality, options.gainmapScale, options.multiChannelGainmap, options.keepExif,
+                                        options.allowSdr, options.speedLevel, options.resizePercent,
+                                        threads, options.keepLocation, motionXmp, options.onlySmaller,
+                                        avifGainmapCompatibility = options.avifGainmapCompatibility,
+                                        heicGainmapCompatibility = options.heicGainmapCompatibility,
+                                        jxlJpegReconstruction = options.jxlJpegReconstruction,
+                                        maxInputBytes = stillInputBytes)
+                                }
                             }
                         }
                     }
                     // Native retry reuses prepared pixels and the lossless gain map.
-                    var result = transcode(options.quality)
+                    var result = performance.measure("native_transcode") { transcode(options.quality) }
                     if (!result.isSuccess) { file.delete(); error(result.error) }
                     var liveAttached = false
                     if (motionInfo != null) {
                         if (options.format == OutputFormat.JPEG || options.format == OutputFormat.HEIC) {
-                            liveAttached = withContext(Dispatchers.IO) {
+                            liveAttached = performance.measure("motion_attach") { withContext(Dispatchers.IO) {
                                 MotionPhotoHelper.attachMotionPhoto(app, source, file, options.format, motionInfo)
-                            }
+                            } }
                             if (liveAttached) {
                                 result = result.copy(outputBytes = file.length())
                             }
+                        }
+                        if (stillInputBytes > 0L) {
+                            val fullInput = maxOf(item.sizeBytes, result.inputBytes + motionInfo.videoLength)
+                            result = result.copy(inputBytes = fullInput)
                         }
                     }
 
@@ -208,17 +232,22 @@ internal class ConversionRunner(
                         repo.update(id) { it.copy(status = QueueStatus.SKIPPED, result = result, error = why) }
                         continue
                     }
+                    var platformValidated = false
                     if (result.hasGainMap && ((options.format == OutputFormat.AVIF && options.avifGainmapCompatibility) ||
                         (options.format == OutputFormat.HEIC && options.heicGainmapCompatibility))) {
-                        withContext(Dispatchers.IO) { HdrOutputValidation.requireReadableGainmap(file) }
+                        platformValidated = performance.measure("platform_validation") {
+                            withContext(Dispatchers.IO) { HdrOutputValidation.requireReadableGainmap(file) }
+                        }
                     } else if (!result.hasGainMap) {
-                        withContext(Dispatchers.IO) { SdrOutputValidation.requireReadable(file, options.format) }
+                        platformValidated = performance.measure("platform_validation") {
+                            withContext(Dispatchers.IO) { SdrOutputValidation.requireReadable(file, options.format) }
+                        }
                     }
                     val name = outputName(item.displayName, options.format.extension, id, item.createdAt, motionPhoto = liveAttached)
                     val liveSummary = if (motionInfo != null) {
                         if (liveAttached) " · 实况已保留(无损直通)" else " · 原图实况(导出静止HDR)"
                     } else ""
-                    val summary = options.summary() + liveSummary
+                    val summary = options.summary(probe.container) + liveSummary
                     // Commit the durable private output first. Saving can be retried without encoding again.
                     var entity = HistoryEntity(displayName = name, inputUri = item.uri, outputUri = file.path,
                         inputBytes = result.inputBytes, outputBytes = result.outputBytes, width = result.width, height = result.height,
@@ -226,32 +255,37 @@ internal class ConversionRunner(
                         format = options.format.label, inputFormat = probe.containerLabel, durationMs = result.durationMs,
                         maxContentBoost = result.maxContentBoost, createdAt = if (item.createdAt > 0L) item.createdAt else System.currentTimeMillis(), status = HistoryEntity.STATUS_DONE,
                         taskId = id, batchId = batchId, saveState = "PENDING", settingsSummary = summary, hasExif = result.hasExif)
-                    val historyId = withContext(NonCancellable) { app.database.historyDao().insert(entity) }
+                    val historyId = performance.measure("history_checkpoint") {
+                        withContext(NonCancellable) { app.database.historyDao().insert(entity) }
+                    }
                     entity = entity.copy(id = historyId)
                     val mayPublish = options.autoSave && app.galleryPublishingAllowed.value &&
                         app.database.taskDao().batch(batchId)?.cancelled == false
                     val outputFingerprint = if (options.autoReplaceOriginals || mayPublish) {
-                        withContext(Dispatchers.IO) { MediaStoreSaver.fingerprintOf(file) }
+                        performance.measure("output_fingerprint") { withContext(Dispatchers.IO) { MediaStoreSaver.fingerprintOf(file) } }
                     } else null
                     if (options.autoReplaceOriginals) {
-                        AutoReplacement.stage(
+                        performance.measure("replacement_prepare") { AutoReplacement.stage(
                             app = app,
                             history = entity,
                             originalHash = originalHash,
                             outputFingerprint = outputFingerprint,
                             knownMotion = motionInfo,
                             hasKnownMotion = true,
-                        )
+                            platformValidated = platformValidated,
+                        ) }
                         entity = app.database.historyDao().byId(historyId) ?: entity
                     }
                     var verifiedSave = false
                     // 指纹和自动替换校验会挂起；此时用户可能已切后台或取消批次，不能复用先前状态。
                     if (options.autoSave && app.database.taskDao().batch(batchId)?.cancelled == false &&
                         app.galleryPublishingAllowed.value) {
-                        entity = OutputStore.save(app, entity, outputFingerprint)
+                        entity = performance.measure("publish") { OutputStore.save(app, entity, outputFingerprint) }
                         verifiedSave = entity.saveState == "SAVED"
                     }
-                    if (options.autoReplaceOriginals) AutoReplacement.saved(app, entity, outputVerified = verifiedSave)
+                    if (options.autoReplaceOriginals) performance.measure("replacement_saved") {
+                        AutoReplacement.saved(app, entity, outputVerified = verifiedSave)
+                    }
                     repo.update(id) { it.copy(status = QueueStatus.DONE, progress = 100, result = result,
                         outputUri = entity.outputUri, historyId = historyId,
                         error = if (entity.saveState == "FAILED") "转换完成，保存失败；可在详情重试保存" else if (entity.saveState != "SAVED") { if (options.autoSave) "已转换，回到应用后自动保存" else "待保存，可直接分享" } else null) }
@@ -261,7 +295,20 @@ internal class ConversionRunner(
                         withContext(Dispatchers.IO) { File(app.filesDir, "outputs/$id.${options.format.extension}").delete() }
                     }
                     repo.update(id) { it.copy(status = QueueStatus.FAILED, error = e.message ?: "转换失败") }
-                } finally { withContext(NonCancellable) { repo.flush() } }
+                } finally {
+                    var checkpointCompleted = false
+                    try {
+                        performance.measure("final_checkpoint") { withContext(NonCancellable) { repo.flush() } }
+                        checkpointCompleted = true
+                    } finally {
+                        val outcome = repo.find(id)?.status?.name ?: "REMOVED"
+                        performance.finish(when {
+                            !checkpointCompleted -> "CHECKPOINT_FAILED"
+                            outcome == "CONVERTING" -> "INTERRUPTED"
+                            else -> outcome
+                        }, ::currentThermalStatus)
+                    }
+                }
             }
         } finally {
             repo.updateAll(ids) { if (it.status == QueueStatus.CONVERTING) it.copy(status = QueueStatus.READY, error = "已中断，可继续") else it }

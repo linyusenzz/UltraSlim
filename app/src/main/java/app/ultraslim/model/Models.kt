@@ -37,4 +37,5 @@ data class ConversionSettings(
     val resizePercent: Int = 100,
     val avifGainmapCompatibility: Boolean = true,
     val heicGainmapCompatibility: Boolean = true,
+    val jxlJpegReconstruction: Boolean = false,
 )

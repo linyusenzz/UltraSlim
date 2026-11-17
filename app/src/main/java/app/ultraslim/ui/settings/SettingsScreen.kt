@@ -99,6 +99,8 @@ fun SettingsScreen(onBack: () -> Unit) {
         }
         SettingsGroup("画面与兼容性") {
             val compatibleFormat = defaults.format == OutputFormat.AVIF || defaults.format == OutputFormat.HEIC
+            val jxlFormat = defaults.format == OutputFormat.JXL
+            val totalItems = if (compatibleFormat || jxlFormat) 2 else 1
             if (compatibleFormat) {
                 val avif = defaults.format == OutputFormat.AVIF
                 SettingItem(if (avif) "AVIF 相册兼容模式" else "HEIC 相册兼容模式",
@@ -106,10 +108,16 @@ fun SettingsScreen(onBack: () -> Unit) {
                     else "保留增益图尺寸与 HDR 参数，彩色增益图色度有损；关闭后部分相册可能偏色或不显示 HDR",
                     Icons.Rounded.HdrOn,
                     if (avif) defaults.avifGainmapCompatibility else defaults.heicGainmapCompatibility,
-                    { if (avif) vm.setAvifGainmapCompatibility(it) else vm.setHeicGainmapCompatibility(it) }, 0, 2)
+                    { if (avif) vm.setAvifGainmapCompatibility(it) else vm.setHeicGainmapCompatibility(it) }, 0, totalItems)
+            } else if (jxlFormat) {
+                SettingItem("保留 JPEG 重建能力",
+                    "JPEG 主图保留原始尺寸，可还原经隐私设置处理后的主图 JPEG。关闭保留位置时也会移除 XMP 与 IPTC。其他输入按常规参数编码。",
+                    Icons.Rounded.Restore,
+                    defaults.jxlJpegReconstruction,
+                    vm::setJxlJpegReconstruction, 0, totalItems)
             }
             SettingItem("允许纯 SDR 转换", "也转换没有增益图的普通照片", Icons.Rounded.Image,
-                defaults.allowSdr, vm::setAllowSdr, if (compatibleFormat) 1 else 0, if (compatibleFormat) 2 else 1)
+                defaults.allowSdr, vm::setAllowSdr, if (totalItems == 2) 1 else 0, totalItems)
         }
         SettingsGroup("照片信息与隐私") {
             SettingItem("保留 EXIF 信息", "保留拍摄器材、曝光参数与拍摄时间", Icons.Rounded.CameraAlt,

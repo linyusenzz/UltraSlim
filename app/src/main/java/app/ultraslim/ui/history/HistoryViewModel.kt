@@ -8,10 +8,12 @@ import app.ultraslim.UltraSlimApp
 import app.ultraslim.convert.MediaStoreTrashHelper
 import app.ultraslim.convert.OutputStore
 import app.ultraslim.data.HistoryEntity
+import app.ultraslim.data.HistoryPage
 import app.ultraslim.data.HistoryStats
 import kotlinx.coroutines.Job
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -21,6 +23,11 @@ data class HistoryUiState(
     val convertedCount: Int = 0,
     val busy: BusyState? = null,
     val stats: HistoryStats = HistoryStats(),
+    val hasMore: Boolean = false,
+    val olderWindow: Boolean = false,
+    val atWindowLimit: Boolean = false,
+    val loadingPage: Boolean = false,
+    val windowKey: String = "",
 ) {
     val busyNow: Boolean get() = busy != null
 }
@@ -28,17 +35,56 @@ data class HistoryUiState(
 /** 长时批量操作的进度；null = 空闲。 */
 data class BusyState(val label: String, val done: Int, val total: Int)
 
+data class HistorySelectionState(
+    val ids: Set<Long> = emptySet(),
+    val items: List<HistoryEntity> = emptyList(),
+)
+
+private data class HistoryWindowResult(
+    val window: HistoryWindow = HistoryWindow(),
+    val page: HistoryPage = HistoryPage(emptyList(), 0, false),
+)
+
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
     private val dao = app.database.historyDao()
-    private val limit = MutableStateFlow(100)
-    /** DB 层筛选（""=全部，其余为 saveState 值），让筛选跨分页生效。 */
-    private val filter = MutableStateFlow("")
+    private val navigation = HistoryWindowNavigation()
+    private val window = MutableStateFlow(navigation.current)
 
     /** UI 侧 rememberSaveable 恢复后回填，保证筛选状态在页面往返后不丢。 */
     fun setFilter(saveState: String) {
-        filter.value = saveState
+        window.value = navigation.filter(saveState)
     }
+
+    // Conflate BEFORE SQL, including a trailing write. The first query is immediate, while
+    // continuous writes cannot restart a slow query or materialize a window for every image.
+    private fun historyChanges(): Flow<Unit> = app.database.invalidationTracker
+        .createFlow("history", emitInitialState = true).conflate().transform {
+            emit(Unit)
+            delay(300L)
+        }
+
+    private val pages = window.flatMapLatest { request ->
+        historyChanges().map {
+            HistoryWindowResult(request, dao.window(request.filter,
+                request.before?.createdAt ?: Long.MAX_VALUE,
+                request.before?.id ?: Long.MAX_VALUE, request.limit))
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistoryWindowResult())
+
+    private val selectedIds = MutableStateFlow<Set<Long>>(emptySet())
+    val selection: StateFlow<HistorySelectionState> = combine(selectedIds, pages) { ids, loaded ->
+        if (ids.isEmpty()) HistorySelectionState()
+        else {
+            val inWindow = loaded.page.items.associateBy { it.id }
+            val missingIds = ids.filter { !inWindow.containsKey(it) }
+            val fetched = if (missingIds.isEmpty()) emptyMap()
+                else missingIds.chunked(500).flatMap { dao.byIds(it) }.associateBy { it.id }
+            HistorySelectionState(ids, ids.mapNotNull { inWindow[it] ?: fetched[it] })
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistorySelectionState())
+
+    fun setSelectedIds(ids: Set<Long>) { selectedIds.value = ids.toSet() }
 
     private val busyState = MutableStateFlow<BusyState?>(null)
     private var busyJob: Job? = null
@@ -46,31 +92,41 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
     val events = _events.asSharedFlow()
     private val _deleteCandidates = MutableStateFlow<List<HistoryEntity>>(emptyList())
     val deleteCandidates = _deleteCandidates.asStateFlow()
+    private var deleteRequest = 0L
 
     fun cancelBusy() {
         busyJob?.cancel()
     }
 
     fun cancelDelete() {
+        deleteRequest++
         _deleteCandidates.value = emptyList()
     }
 
     fun requestDelete(ids: Set<Long>) {
-        if (busyState.value == null) _deleteCandidates.value = uiState.value.items.filter { it.id in ids }
+        if (busyState.value != null) return
+        val request = ++deleteRequest
+        viewModelScope.launch {
+            val rows = ids.chunked(500).flatMap { dao.byIds(it) }
+            if (request == deleteRequest && busyState.value == null) _deleteCandidates.value = rows
+        }
     }
 
     fun requestDeleteDate(date: java.time.LocalDate, filter: String) {
         if (busyState.value != null) return
+        val request = ++deleteRequest
         viewModelScope.launch {
             val range = historyDateRange(date)
-            _deleteCandidates.value = dao.inDateRange(range.first, range.last + 1)
+            val rows = dao.inDateRange(range.first, range.last + 1)
                 .filter { it.matchesHistoryFilter(filter) }
+            if (request == deleteRequest && busyState.value == null) _deleteCandidates.value = rows
         }
     }
 
     fun deleteConfirmed() {
         if (busyState.value != null) return
         val records = _deleteCandidates.value
+        deleteRequest++
         _deleteCandidates.value = emptyList()
         busyJob = viewModelScope.launch {
             try {
@@ -100,32 +156,47 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
     }
 
     val uiState: StateFlow<HistoryUiState> = combine(
-        combine(limit, filter) { l, f -> l to f }.flatMapLatest { (l, f) -> dao.flowPage(l, f) },
-        filter.flatMapLatest { f -> dao.flowCount(f) },
+        pages,
+        window,
         busyState,
         app.historyRepository.stats,
-    ) { items, count, working, stats ->
+    ) { loaded, requested, working, stats ->
         HistoryUiState(
-            items = items,
+            items = loaded.page.items,
             totalSavedBytes = stats.totalSavedBytes,
-            convertedCount = count,
+            convertedCount = loaded.page.totalCount,
             busy = working,
             stats = stats,
+            hasMore = loaded.page.hasMore,
+            olderWindow = loaded.window.before != null,
+            atWindowLimit = loaded.window.limit >= HistoryWindow.MAX_ITEMS,
+            loadingPage = loaded.window != requested,
+            windowKey = "${loaded.window.filter}:${loaded.window.before}",
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistoryUiState())
 
     fun loadMore() {
-        limit.value += 100
+        if (busyState.value != null || pages.value.window != window.value) return
+        val last = pages.value.page.items.lastOrNull()?.let { HistoryCursor(it.createdAt, it.id) }
+        window.value = navigation.more(last, pages.value.page.hasMore)
+    }
+
+    fun showNewer() {
+        if (busyState.value == null && pages.value.window == window.value) window.value = navigation.newer()
+    }
+
+    fun showLatest() {
+        if (busyState.value == null && pages.value.window == window.value) window.value = navigation.latest()
     }
 
     fun saveSelected(ids: Set<Long>) {
         if (busyState.value != null) return
-        val targets = uiState.value.items.filter { it.id in ids && it.saveState != "SAVED" }
-        if (targets.isEmpty()) return
         busyJob = viewModelScope.launch {
             var done = 0
             var failed = 0
             try {
+                busyState.value = BusyState("保存中", 0, ids.size)
+                val targets = ids.chunked(500).flatMap { dao.byIds(it) }.filter { it.saveState != "SAVED" }
                 busyState.value = BusyState("保存中", 0, targets.size)
                 var processed = 0
                 for (entity in targets) {
@@ -154,13 +225,20 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
     val trashableOriginals: StateFlow<Map<Long, Uri>> = trashableCache.asStateFlow()
     private val originalUriCache = OriginalUriCache()
 
+    fun refreshOriginals() {
+        originalUriCache.invalidate()
+        ensureTrashableResolved((uiState.value.items + selection.value.items).distinctBy { it.id })
+    }
+
     private fun publishTrashableCache() {
         trashableCache.value = originalUriCache.snapshot().mapValues { Uri.parse(it.value) }
     }
 
     /** 补齐缺缓存条目的解析；页面加载或筛选变化时调用，重复调用只解析增量。 */
     fun ensureTrashableResolved(items: List<HistoryEntity>) {
-        val missing = originalUriCache.plan(items.map { OriginalUriCache.Source(it.id, it.inputUri) })
+        val sources = items.map { OriginalUriCache.Source(it.id, it.inputUri) }
+        originalUriCache.retain(sources)
+        val missing = originalUriCache.plan(sources)
         // Relinked records must stop offering the old original immediately, before the new query finishes.
         publishTrashableCache()
         if (missing.isEmpty()) return
@@ -185,7 +263,6 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
     suspend fun requestTrashSelected(ids: Set<Long>): IntentSender? {
         // The cache only controls presentation. Destructive requests use the current persisted link.
         val rows = ids.chunked(500).flatMap { dao.byIds(it) }
-        ensureTrashableResolved(rows)
         val uris = rows.map { Uri.parse(it.inputUri) }.distinct()
         if (uris.isEmpty()) {
             _events.tryEmit("所选照片的原图不在系统相册管理范围内")
@@ -199,8 +276,9 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
 
     private var pendingTrashUris = emptySet<Uri>()
     fun onSelectedOriginalsTrashed(count: Int) {
-        originalUriCache.removeUris(pendingTrashUris.mapTo(mutableSetOf()) { it.toString() })
-        publishTrashableCache()
+        // Returning from the system dialog may have started a pre-result lookup. Reject it
+        // even if invalidate() had already removed the old positive result from the cache.
+        refreshOriginals()
         _events.tryEmit("已将 ${pendingTrashUris.size} 张原图移至系统相册回收站（恢复期限以系统回收站为准）")
     }
 
@@ -214,13 +292,13 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
                     return@launch
                 }
                 busyState.value = BusyState("清空中", 0, 0)
-                val records = dao.all()
+                val ids = dao.allIds()
                 var processed = 0
-                for (chunk in records.chunked(50)) {
+                for (chunk in ids.chunked(50)) {
                     coroutineContext.ensureActive()
-                    OutputStore.deleteBatch(app, chunk.map { it.id })
+                    OutputStore.deleteBatch(app, chunk)
                     processed += chunk.size
-                    busyState.value = BusyState("清空中", processed, records.size)
+                    busyState.value = BusyState("清空中", processed, ids.size)
                 }
             } catch (e: OutputStore.ConversionInProgress) {
                 _events.emit(e.message.orEmpty())

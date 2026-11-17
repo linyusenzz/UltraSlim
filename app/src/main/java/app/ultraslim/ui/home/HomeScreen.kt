@@ -69,10 +69,8 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
     val vm: HomeViewModel = viewModel(factory = appViewModelFactory { HomeViewModel(it) })
     val state by vm.uiState.collectAsStateWithLifecycle()
     val scanning by vm.scanning.collectAsStateWithLifecycle()
-    val scanProgress by vm.scanProgress.collectAsStateWithLifecycle()
     val stopping by vm.stopping.collectAsStateWithLifecycle()
     val importing by vm.importing.collectAsStateWithLifecycle()
-    val importProgress by vm.importProgress.collectAsStateWithLifecycle()
     val scrollBehavior = TopAppBarDefaults.enterAlwaysScrollBehavior()
     val batchProgress by animateFloatAsState(
         targetValue = if (state.batchTotal > 0) state.batchProcessed.toFloat() / state.batchTotal else 0f,
@@ -219,6 +217,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
             onKeepLocationChange = vm::setKeepLocation,
             onAvifGainmapCompatibilityChange = vm::setAvifGainmapCompatibility,
             onHeicGainmapCompatibilityChange = vm::setHeicGainmapCompatibility,
+            onJxlJpegReconstructionChange = vm::setJxlJpegReconstruction,
             onSaveAsDefault = vm::saveCurrentAsDefault,
             onResetToDefault = vm::resetToDefault,
         )
@@ -252,15 +251,15 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                         } else {
                             CircularProgressIndicator(Modifier.size(24.dp).testTag("conversion-spinner"), strokeWidth = 2.dp)
                         }
-                        Text(when {
-                            importing -> importProgress.ifBlank { "正在检查导入的照片…" }
-                            scanning -> scanProgress.ifBlank { "正在检查照片…" }
-                            stopping -> "当前照片处理完成后停止"
-                            thermal != null -> thermal.message
-                            else -> state.queue.firstOrNull { it.status == QueueStatus.CONVERTING }?.let { "正在处理：${it.displayName}" }
-                                ?: "正在准备或等待继续…"
-                        }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
-                            maxLines = if (thermal != null) 4 else 2, overflow = TextOverflow.Ellipsis)
+                        HomeStatusText(
+                            vm = vm,
+                            importing = importing,
+                            scanning = scanning,
+                            stopping = stopping,
+                            thermal = thermal,
+                            convertingName = convertingItem?.displayName,
+                            modifier = Modifier.weight(1f),
+                        )
                     }
                 }
                 val mode = when {
@@ -392,7 +391,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                                 ) {
                                     LoadingIndicator(Modifier.size(36.dp))
                                     Spacer(Modifier.width(12.dp))
-                                    Text(if (scanning) scanProgress else importProgress, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                    ScanImportBannerText(vm = vm, scanning = scanning, modifier = Modifier.weight(1f))
                                     if (scanning) TextButton(onClick = vm::cancelScan) { Text("停止") }
                                     else if (importing) TextButton(onClick = vm::cancelImport) { Text("停止") }
                                 }
@@ -514,7 +513,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                             Text("待处理 · ${pendingItems.size + if (convertingItem != null) 1 else 0}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
                         }
                         convertingItem?.let { active ->
-                            item(key = active.id) {
+                            item(key = active.id, contentType = "queue-row") {
                                 QueueRow(active, onRemove = {}, onRetry = {}, onOpen = {},
                                     modifier = Modifier.testTag("queue-row-${active.id}").animateItem(
                                         fadeInSpec = Motion.fast(), placementSpec = Motion.itemPlacement(), fadeOutSpec = Motion.exit(Motion.Fast)))
@@ -522,7 +521,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                         }
                         pendingGroups.forEach { group ->
                             if (pendingGroups.size > 1) {
-                                item(key = "group-pending-${group.key}") {
+                                item(key = "group-pending-${group.key}", contentType = "group-header") {
                                     BatchGroupHeader(
                                         title = "${group.title} 导入",
                                         count = group.items.size,
@@ -539,7 +538,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                                     )
                                 }
                             }
-                            items(group.items, key = { it.id }) { item ->
+                            items(group.items, key = { it.id }, contentType = { "queue-row" }) { item ->
                                 QueueRow(
                                     item,
                                     onRemove = {
@@ -592,7 +591,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                             val failedCount = group.items.count { it.status == QueueStatus.FAILED }
                             val skippedCount = group.items.count { it.status == QueueStatus.SKIPPED }
                             val doneCount = group.items.count { it.status == QueueStatus.DONE }
-                            item(key = "group-finished-${group.key}") {
+                            item(key = "group-finished-${group.key}", contentType = "group-header") {
                                 BatchGroupHeader(
                                     title = group.title,
                                     count = group.items.size,
@@ -616,7 +615,7 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                                     }
                                 )
                             }
-                            items(group.items, key = { it.id }) { item ->
+                            items(group.items, key = { it.id }, contentType = { "queue-row" }) { item ->
                                 QueueRow(
                                     item,
                                     onRemove = {
@@ -794,6 +793,40 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
 
 private enum class HomeAction { Stopping, Converting, Ready, Done }
 
+@Composable
+private fun ScanImportBannerText(vm: HomeViewModel, scanning: Boolean, modifier: Modifier = Modifier) {
+    val scanProgress by vm.scanProgress.collectAsStateWithLifecycle()
+    val importProgress by vm.importProgress.collectAsStateWithLifecycle()
+    Text(if (scanning) scanProgress else importProgress, modifier, style = MaterialTheme.typography.bodyMedium)
+}
+
+@Composable
+private fun HomeStatusText(
+    vm: HomeViewModel,
+    importing: Boolean,
+    scanning: Boolean,
+    stopping: Boolean,
+    thermal: ConversionThermalState?,
+    convertingName: String?,
+    modifier: Modifier = Modifier,
+) {
+    val scanProgress by vm.scanProgress.collectAsStateWithLifecycle()
+    val importProgress by vm.importProgress.collectAsStateWithLifecycle()
+    Text(
+        when {
+            importing -> importProgress.ifBlank { "正在检查导入的照片…" }
+            scanning -> scanProgress.ifBlank { "正在检查照片…" }
+            stopping -> "当前照片处理完成后停止"
+            thermal != null -> thermal.message
+            else -> convertingName?.let { "正在处理：$it" } ?: "正在准备或等待继续…"
+        },
+        modifier = modifier,
+        style = MaterialTheme.typography.bodySmall,
+        maxLines = if (thermal != null) 4 else 2,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun QueueRow(
@@ -842,7 +875,8 @@ private fun QueueCard(
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                UltraAsyncImage(item.uri, null, ContentScale.Crop, Modifier.size(76.dp).clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surfaceContainer), maxDim = 384, forceSdr = true)
+                val thumbMaxDim = rememberThumbMaxDim()
+                UltraAsyncImage(item.uri, null, ContentScale.Crop, Modifier.size(76.dp).clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surfaceContainer), maxDim = thumbMaxDim, forceSdr = true)
                 Column(Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(if(item.probe != null) "${item.probe.width} × ${item.probe.height}  ·  ${formatBytes(item.sizeBytes)}" else formatBytes(item.sizeBytes), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {

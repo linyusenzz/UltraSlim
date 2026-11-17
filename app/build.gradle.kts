@@ -101,6 +101,19 @@ android {
         debug {
             applicationIdSuffix = providers.gradleProperty("ultraslimDebugSuffix").orElse(".debug").get()
         }
+        create("benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            applicationIdSuffix = ".benchmark"
+            matchingFallbacks += "release"
+            isDebuggable = false
+        }
+        create("baseline") {
+            initWith(getByName("benchmark"))
+            // Capture source-symbol rules; benchmark the minified variant separately.
+            isMinifyEnabled = false
+            isShrinkResources = false
+        }
     }
 
     externalNativeBuild {
@@ -119,6 +132,7 @@ android {
 
 
     sourceSets.getByName("androidTest").assets.srcDir("../tests/fixtures/libultrahdr")
+    sourceSets.getByName("androidTest").assets.srcDir("$projectDir/schemas")
 
     experimentalProperties["android.experimental.enableScreenshotTest"] = true
 
@@ -156,6 +170,7 @@ dependencies {
     }
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.espresso)
     androidTestImplementation(libs.androidx.window.testing)
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
@@ -192,6 +207,7 @@ screenshotTestImplementation(libs.compose.ui.tooling)
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.coil.compose)
+    implementation(libs.androidx.profileinstaller)
     implementation(libs.kotlinx.coroutines.android)
 }
 

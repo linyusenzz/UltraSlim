@@ -503,15 +503,14 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
     var viewSize by remember { mutableStateOf(IntSize(1, 1)) }
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
-    // 只在真正跨越阈值时改变图像请求档位。直接在组合期用 zoomScale > 1f 会在双击动画的
-    // 某一帧翻转 key，取消正在进行的解码并从头再来一次整幅解码。
-    var highResZoom by remember { mutableStateOf(false) }
+    // 只在真正跨越阈值时升至高分辨率档位，且同一张记录一旦加载 2048 档就保留（已在 detailMemory 中），
+    // 不在缩回 1x 时回退重取 1600 档。
+    var highResZoom by remember(entity.id, entity.inputUri, entity.outputUri) { mutableStateOf(false) }
     // zoomedIn 用 derivedStateOf：捏合期间每帧变化的 zoomScale 不应每帧重组整张卡片。
     val zoomedIn by remember { derivedStateOf { zoomScale > 1f } }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(entity.id, entity.inputUri, entity.outputUri) {
         snapshotFlow { zoomScale }.collect { z ->
             if (!highResZoom && z >= 1.05f) highResZoom = true
-            else if (highResZoom && z <= 0.98f) highResZoom = false
         }
     }
     val scope = rememberCoroutineScope()
@@ -527,12 +526,6 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
         (scaleNow - 1f) * viewSize.width / 2f,
         (scaleNow - 1f) * viewSize.height / 2f,
     )
-
-    val effectiveFraction = if (compareMode == 1) {
-        if (isHoldingOriginal) 1f else 0f
-    } else {
-        fraction
-    }
 
     val previewHeight = with(density) { (LocalWindowInfo.current.containerSize.height.toDp() * .4f).coerceIn(220.dp, 420.dp) }
     val transform = rememberTransformableState { zoom, pan, _ ->
@@ -621,7 +614,8 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                 forceSdr = true,
                 maxDim = if(highResZoom) 2048 else if(outputLong in 1 until 1600) outputLong else 1600,
                 modifier = Modifier.fillMaxSize().drawWithContent {
-                    clipRect(right = size.width * effectiveFraction) { this@drawWithContent.drawContent() }
+                    val clipFraction = if (compareMode == 1) (if (isHoldingOriginal) 1f else 0f) else fraction
+                    clipRect(right = size.width * clipFraction) { this@drawWithContent.drawContent() }
                 },
             )
 

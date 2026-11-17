@@ -35,19 +35,28 @@ internal fun DeferredOutputHost() {
                         if (page.isEmpty()) break
                         afterCreatedAt = page.last().createdAt
                         afterId = page.last().id
+                        // 同一批次设置按页缓存，整页更新合并成一次 updateAll，避免 32× 列表重建。
+                        val batchCache = HashMap<String, Pair<app.ultraslim.data.BatchEntity, app.ultraslim.data.ConversionDefaults>?>()
+                        val taskUpdates = HashMap<String, Pair<String, String?>>()
                         for (row in page) {
-                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
-                            val batch = app.database.taskDao().batch(row.batchId) ?: continue
-                            val options = runCatching { decodeDefaults(batch.settings) }.getOrNull() ?: continue
+                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) break
+                            val pair = batchCache.getOrPut(row.batchId) {
+                                val b = app.database.taskDao().batch(row.batchId) ?: return@getOrPut null
+                                val o = runCatching { decodeDefaults(b.settings) }.getOrNull() ?: return@getOrPut null
+                                b to o
+                            } ?: continue
+                            val (batch, options) = pair
                             if (batch.cancelled || !options.autoSave) continue
                             // Recheck after the suspend batch lookup, immediately before saving.
-                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
+                            if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) break
                             try {
                                 val saved = OutputStore.save(app, row)
-                                if (options.autoReplaceOriginals) AutoReplacement.saved(app, saved)
-                                row.taskId?.let { id -> app.conversionRepository.update(id) {
-                                    it.copy(outputUri = saved.outputUri, error = if (saved.saveState == "SAVED") null else "保存失败，可在详情重试")
-                                } }
+                                if (options.autoReplaceOriginals) {
+                                    AutoReplacement.saved(app, saved, outputVerified = saved.saveState == "SAVED")
+                                }
+                                row.taskId?.let { id ->
+                                    taskUpdates[id] = saved.outputUri to (if (saved.saveState == "SAVED") null else "保存失败，可在详情重试")
+                                }
                             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                             catch (e: Exception) {
                                 // A deleted history row or lost provider must not crash the foreground app.
@@ -57,6 +66,13 @@ internal fun DeferredOutputHost() {
                                 }
                             }
                         }
+                        if (taskUpdates.isNotEmpty()) {
+                            app.conversionRepository.updateAll(taskUpdates.keys) { item ->
+                                val update = taskUpdates[item.id] ?: return@updateAll item
+                                item.copy(outputUri = update.first, error = update.second)
+                            }
+                        }
+                        if (!app.galleryPublishingAllowed.value || app.conversionServiceRunning.value) return@collect
                     }
                 }
             } finally { app.galleryPublicationRunning.value = false }

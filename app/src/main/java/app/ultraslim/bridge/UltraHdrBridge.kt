@@ -87,10 +87,24 @@ object UltraHdrBridge {
         retrySmaller: Boolean = false,
         avifGainmapCompatibility: Boolean = false,
         heicGainmapCompatibility: Boolean = false,
+        jxlJpegReconstruction: Boolean = false,
+        maxInputBytes: Long = 0L,
     ): TranscodeResult
 
     @JvmStatic
     external fun nativeVersion(): String
+
+    /**
+     * Decodes the primary SDR rendition of an image directly into an [android.graphics.Bitmap]
+     * (preserving Display P3 / BT.2020 ColorSpace when tagged), avoiding an intermediate
+     * JPEG encode + BitmapFactory decode pass.
+     */
+    @JvmStatic
+    external fun nativeDecodePreviewBitmap(
+        fd: Int,
+        maxDim: Int,
+        maxWorkingBytes: Long = Long.MAX_VALUE,
+    ): android.graphics.Bitmap?
 
     /**
      * Decodes the primary SDR rendition of an image to a small JPEG, for previews

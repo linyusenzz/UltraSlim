@@ -6,6 +6,21 @@
 
 namespace ultraslim {
 
+// Diagnostic only: timings are inclusive, so nested stages must not be summed.
+// No file names, image metadata or pixels are reported. The callback is invoked
+// synchronously on the calling thread and must not throw or re-enter this API.
+struct NativeTraceEvent {
+  const char* operation;
+  const char* stage;
+  double durationMs;
+  uint64_t bytes;
+};
+using NativeTraceSink = void (*)(const NativeTraceEvent&, void*) noexcept;
+// Applies to the current thread; nullptr removes the observer. Without a sink,
+// ULTRASLIM_TRACE=1 (host) / debug.ultraslim.trace=1 (Android) enables diagnostic
+// stderr/logcat output. Disabled tracing does not sample clocks per stage.
+void setNativeTraceSink(NativeTraceSink sink, void* userData = nullptr);
+
 struct ProbeResult {
   int errorCode = 0;  // 0 = ok, otherwise failed
   std::string error;
@@ -31,6 +46,9 @@ struct TranscodeOptions {
   // HEIC uses BT.601 4:2:0 for platform HDR decoding. RGB chroma is lossy;
   // mono values use full-range Y with neutral chroma and remain exact.
   bool heicGainmapCompatibility = false;
+  // When outCodec == 3 (JXL) and input is JPEG, losslessly transcode JPEG DCT
+  // coefficients and store a jbrd reconstruction box (--lossless_jpeg=1 --allow_jpeg_reconstruction=1).
+  bool jxlJpegReconstruction = false;
   bool retrySmaller = false; // One base-quality retry, reusing decoded pixels and lossless gain map.
   int gainmapQuality = 60;
   int gainmapScale = 4;
@@ -40,9 +58,18 @@ struct TranscodeOptions {
   bool allowSdrTranscode = true;  // re-encode plain SDR images too (no gain map)
   int speedLevel = 1;             // 0 = 画质优先, 1 = 平衡, 2 = 速度优先
   int resizePercent = 100;        // 25..100, output resolution as % of source
+  // Optional prefix byte limit on inFd (e.g. still portion of a Motion Photo, excluding trailing MP4).
+  int64_t maxInputBytes = 0;
   // Threads for one encoder instance. 0 = half the machine, so two parallel jobs fit.
   std::vector<uint8_t> xmp;  // Optional HEIF motion metadata, authored before video append.
   int codecThreads = 0;
+};
+
+struct PreviewBitmapData {
+  std::vector<uint8_t> rgba;  // RGBA8888
+  int width = 0;
+  int height = 0;
+  int colorSpace = 0;  // 0 = sRGB, 1 = Display P3, 2 = BT.2020, 3 = linear sRGB
 };
 
 struct TranscodeResult {
@@ -76,6 +103,8 @@ TranscodeResult transcodeImage(int inFd, int outFd, const TranscodeOptions& opti
  */
 std::vector<uint8_t> decodePreviewJpeg(int fd, int maxDim, int quality = 82,
                                      uint64_t maxWorkingBytes = UINT64_MAX);
+PreviewBitmapData decodePreviewRgba(int fd, int maxDim,
+                                    uint64_t maxWorkingBytes = UINT64_MAX);
 
 /** Debug: decode the primary image with heif_chroma_undefined and return the raw Y plane. */
 std::vector<uint8_t> debugDecodePlaneY(int fd, int& w, int& h);

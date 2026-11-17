@@ -67,7 +67,11 @@ find_library(BROTLIDEC_LIB NAMES brotlidec PATHS ${DEPS_PREFIX}/lib NO_DEFAULT_P
 find_library(BROTLICOMMON_LIB NAMES brotlicommon PATHS ${DEPS_PREFIX}/lib NO_DEFAULT_PATH REQUIRED)
 set(JXL_ALL_LIBS ${JXL_LIB} ${JXL_CMS_LIB} ${JXL_THREADS_LIB} ${HWY_LIB} ${BROTLIENC_LIB} ${BROTLIDEC_LIB} ${BROTLICOMMON_LIB})
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(TRANSCODE_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/jni/transcode.cpp)
+# Standalone probing uses the same bounded JPEG scanner as libultrahdr.
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libultrahdr/third_party/image_io/includes)
 
 if(ULTRASLIM_HOST_TEST)
   add_executable(transcode_test ${TRANSCODE_SRCS} ${CMAKE_CURRENT_SOURCE_DIR}/host_test/main.cpp)
@@ -93,6 +97,7 @@ else()
       "-Wl,-z,max-page-size=16384"
       "-Wl,-z,common-page-size=16384"
       "-Wl,--gc-sections"
+      "-Wl,--icf=safe"
       "-Wl,--exclude-libs,ALL")
   target_include_directories(ultraslim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libultrahdr ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libultrahdr/lib/include ${DEPS_PREFIX}/include)
   # Keep the Maven 1.0.1 Kotlin API, rebuilding its JNI component with aligned RELRO.
@@ -104,10 +109,11 @@ else()
       -fomit-frame-pointer -ffunction-sections -fdata-sections)
   target_link_options(androidx.graphics.path PRIVATE
       "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384"
-      "-Wl,--gc-sections" "-Wl,-Bsymbolic-functions")
+      "-Wl,--gc-sections" "-Wl,--icf=safe" "-Wl,-Bsymbolic-functions")
   find_library(log-lib log REQUIRED)
+  find_library(jnigraphics-lib jnigraphics REQUIRED)
   # link order matters for static archives: consumers before providers
-  target_link_libraries(ultraslim PRIVATE core ${HEIF_LIB} ${SVT_LIB} ${AOM_LIB} ${X265_LIB} ${DE265_LIB} ${DAV1D_LIB} ${JPEG_LIB} ${JXL_ALL_LIBS} ${log-lib})
+  target_link_libraries(ultraslim PRIVATE core ${HEIF_LIB} ${SVT_LIB} ${AOM_LIB} ${X265_LIB} ${DE265_LIB} ${DAV1D_LIB} ${JPEG_LIB} ${JXL_ALL_LIBS} ${log-lib} ${jnigraphics-lib})
 endif()
 
 # AGP Debug compiles in-tree code at -O0. Keep the prebuilt codecs as shipped.
@@ -169,6 +175,11 @@ if(ULTRASLIM_HOST_TEST)
   target_compile_definitions(upstream_color PRIVATE UHDR_ENABLE_INTRINSICS=1)
   add_test(NAME upstream_color COMMAND upstream_color)
 
+  add_executable(upstream_metadata host_test/upstream_metadata.cpp)
+  target_include_directories(upstream_metadata PRIVATE ${_color_includes})
+  target_link_libraries(upstream_metadata PRIVATE ${_color_libraries})
+  add_test(NAME upstream_metadata COMMAND upstream_metadata)
+
   add_executable(avif_quality ${TRANSCODE_SRCS} host_test/avif_quality.cpp)
   target_include_directories(avif_quality PRIVATE ${_color_includes})
   target_link_libraries(avif_quality PRIVATE ${_color_libraries})
@@ -183,4 +194,14 @@ if(ULTRASLIM_HOST_TEST)
   target_include_directories(metadata_regression PRIVATE ${_color_includes})
   target_link_libraries(metadata_regression PRIVATE ${_color_libraries})
   add_test(NAME metadata_regression COMMAND metadata_regression ${CMAKE_CURRENT_BINARY_DIR}/regression-output)
+
+  add_executable(probe_diagnostics host_test/probe_diagnostics.cpp)
+  target_include_directories(probe_diagnostics PRIVATE ${_color_includes})
+  target_link_libraries(probe_diagnostics PRIVATE ${_color_libraries})
+  add_test(NAME probe_diagnostics COMMAND probe_diagnostics ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/libultrahdr ${CMAKE_CURRENT_BINARY_DIR}/regression-output)
+
+  add_executable(jxl_reconstruction host_test/jxl_reconstruction.cpp)
+  target_include_directories(jxl_reconstruction PRIVATE ${_color_includes})
+  target_link_libraries(jxl_reconstruction PRIVATE ${_color_libraries})
+  add_test(NAME jxl_reconstruction COMMAND jxl_reconstruction ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/libultrahdr ${CMAKE_CURRENT_BINARY_DIR}/regression-output)
 endif()

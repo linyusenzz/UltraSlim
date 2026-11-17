@@ -45,10 +45,11 @@ class DetailViewModel internal constructor(
     private val app: UltraSlimApp,
     private val historyId: Long,
     private val queryOriginal: (Uri) -> OriginalAccess = { uri ->
-        val trashed = MediaStoreTrashHelper.isOriginalTrashed(app, uri)
-        val accessible = MediaStoreTrashHelper.isOriginalAccessible(app, uri)
-        val resolvable = MediaStoreTrashHelper.resolveToMediaStoreImageUri(app, uri) != null
-        OriginalAccess(trashed, MediaStoreTrashHelper.isTrashSupported && resolvable && accessible && !trashed)
+        val state = MediaStoreTrashHelper.originalState(app, uri)
+        OriginalAccess(
+            trashed = state == MediaStoreTrashHelper.OriginalState.TRASHED,
+            canTrash = state == MediaStoreTrashHelper.OriginalState.PRESENT,
+        )
     },
 ) : ViewModel() {
 

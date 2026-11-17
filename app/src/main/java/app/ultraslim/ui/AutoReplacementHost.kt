@@ -22,9 +22,14 @@ import app.ultraslim.convert.MediaStoreTrashHelper
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 data class ReplacementReview(
@@ -102,17 +107,52 @@ internal fun AutoReplacementHost(): ReplacementReview? {
                     val selected = rows.filter { it.historyId in approved }
                     // 设置/批次/原图状态按轮共享，避免 2000 行逐条重复 provider 与 DataStore 往返。
                     val pass = AutoReplacement.Pass(app)
-                    // Resolve external deletions before hashing/decoding. Already trashed files may still be readable.
+                    // Resolve external deletions in one batch query before concurrent hashing/decoding.
+                    withContext(Dispatchers.IO) { pass.prefetchOriginalStates(selected.map { Uri.parse(it.sourceUri) }) }
                     val verified = mutableListOf<app.ultraslim.data.ReplacementEntity>()
+                    val trashedAlready = mutableListOf<app.ultraslim.data.ReplacementEntity>()
+                    val unavailable = mutableListOf<app.ultraslim.data.ReplacementEntity>()
+                    val toValidate = mutableListOf<app.ultraslim.data.ReplacementEntity>()
                     for (row in selected) {
                         if (cancelReview || !app.galleryPublishingAllowed.value || app.galleryPublicationRunning.value || app.conversionServiceRunning.value) return@collect
-                        val state = withContext(Dispatchers.IO) { pass.originalState(Uri.parse(row.sourceUri)) }
-                        when (state) {
-                            MediaStoreTrashHelper.OriginalState.TRASHED -> AutoReplacement.finish(app, listOf(row), "DONE", "原图已在系统回收站，无需再次确认")
-                            MediaStoreTrashHelper.OriginalState.UNAVAILABLE -> AutoReplacement.finish(app, listOf(row), "SKIPPED", "原图已删除或不可访问，不再请求替换")
-                            MediaStoreTrashHelper.OriginalState.PRESENT -> try { AutoReplacement.validate(app, row, pass = pass); verified += row }
-                            catch (e: CancellationException) { throw e }
-                            catch (e: Exception) { AutoReplacement.finish(app, listOf(row), "SKIPPED", "原图保留：${e.message ?: "校验未通过"}") }
+                        when (withContext(Dispatchers.IO) { pass.originalState(Uri.parse(row.sourceUri)) }) {
+                            MediaStoreTrashHelper.OriginalState.TRASHED -> trashedAlready += row
+                            MediaStoreTrashHelper.OriginalState.UNAVAILABLE -> unavailable += row
+                            MediaStoreTrashHelper.OriginalState.PRESENT -> toValidate += row
+                        }
+                    }
+                    AutoReplacement.finish(app, trashedAlready, "DONE", "原图已在系统回收站，无需再次确认")
+                    AutoReplacement.finish(app, unavailable, "SKIPPED", "原图已删除或不可访问，不再请求替换")
+                    if (toValidate.isNotEmpty()) {
+                        val permits = Semaphore(3)
+                        for (group in toValidate.chunked(24)) {
+                            if (cancelReview || !app.galleryPublishingAllowed.value || app.galleryPublicationRunning.value || app.conversionServiceRunning.value) return@collect
+                            val outcomes = coroutineScope {
+                                group.map { row ->
+                                    async(Dispatchers.IO) {
+                                        permits.withPermit {
+                                            if (cancelReview || !app.galleryPublishingAllowed.value || app.galleryPublicationRunning.value || app.conversionServiceRunning.value) {
+                                                null
+                                            } else {
+                                                try {
+                                                    AutoReplacement.validate(app, row, pass = pass)
+                                                    row to null
+                                                } catch (e: CancellationException) {
+                                                    throw e
+                                                } catch (e: Exception) {
+                                                    row to (e.message ?: "校验未通过")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }.awaitAll()
+                            }
+                            if (cancelReview || !app.galleryPublishingAllowed.value || app.galleryPublicationRunning.value || app.conversionServiceRunning.value) return@collect
+                            for (outcome in outcomes) {
+                                val (row, errMsg) = outcome ?: continue
+                                if (errMsg == null) verified += row
+                                else AutoReplacement.finish(app, listOf(row), "SKIPPED", "原图保留：$errMsg")
+                            }
                         }
                     }
                     if (verified.isEmpty()) {

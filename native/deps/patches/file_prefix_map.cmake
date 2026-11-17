@@ -12,3 +12,9 @@
 if(DEFINED ULTRASLIM_MAP_ROOT AND NOT ULTRASLIM_MAP_ROOT STREQUAL "")
   add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX,ASM>:-ffile-prefix-map=${ULTRASLIM_MAP_ROOT}=/ultraslim-deps>")
 endif()
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-ffunction-sections>"
+                    "$<$<COMPILE_LANGUAGE:C,CXX>:-fdata-sections>")
+if(DEFINED ULTRASLIM_EXTRA_FLAGS AND NOT ULTRASLIM_EXTRA_FLAGS STREQUAL "")
+  separate_arguments(_ultraslim_extra UNIX_COMMAND "${ULTRASLIM_EXTRA_FLAGS}")
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${_ultraslim_extra}>")
+endif()

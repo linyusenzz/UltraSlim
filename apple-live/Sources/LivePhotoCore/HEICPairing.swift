@@ -163,10 +163,32 @@ enum HEICPairing {
             }
         }
         if !children.contains(where:{$0.type=="iref"}) { newMeta += box("iref",refData) }
-        var output=original
-        output.replaceSubrange(meta.start+4..<meta.start+8,with:Data("free".utf8))
-        output += box("mdat",payload)+box("meta",newMeta)
-        try output.write(to:destination,options:.atomic)
+        let trailing = box("mdat", payload) + box("meta", newMeta)
+        let dir = destination.deletingLastPathComponent()
+        let temp = dir.appendingPathComponent(".ultraslim-live-\(UUID().uuidString).tmp")
+        FileManager.default.createFile(atPath: temp.path, contents: nil)
+        do {
+            let handle = try FileHandle(forWritingTo: temp)
+            do {
+                try handle.write(contentsOf: original[0..<meta.start + 4])
+                try handle.write(contentsOf: Data("free".utf8))
+                try handle.write(contentsOf: original[meta.start + 8..<original.count])
+                try handle.write(contentsOf: trailing)
+                try handle.synchronize()
+                try handle.close()
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temp)
+            } else {
+                try FileManager.default.moveItem(at: temp, to: destination)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temp)
+            throw error
+        }
         guard let check=CGImageSourceCreateWithURL(destination as CFURL,nil),let props=CGImageSourceCopyPropertiesAtIndex(check,0,nil) as? [String:Any],let maker=props[kCGImagePropertyMakerAppleDictionary as String] as? [String:Any],maker["17"] as? String==identifier else { throw LiveError("Apple 未识别配对标识，未导入相册") }
         for type in [kCGImageAuxiliaryDataTypeISOGainMap,kCGImageAuxiliaryDataTypeHDRGainMap] {
             if CGImageSourceCopyAuxiliaryDataInfoAtIndex(image,0,type) != nil && CGImageSourceCopyAuxiliaryDataInfoAtIndex(check,0,type)==nil { throw LiveError("配对后增益图不可读，未导入相册") }

@@ -14,7 +14,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
-class UltraSlimApp : Application() {
+class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
+
+    override fun newImageLoader(context: coil3.PlatformContext): coil3.ImageLoader =
+        coil3.ImageLoader.Builder(context)
+            .memoryCache {
+                coil3.memory.MemoryCache.Builder()
+                    .maxSizeBytes(20 * 1024 * 1024)
+                    .build()
+            }
+            .build()
 
     // Shared with legacy workers to prevent overlapping native encoders during an upgrade.
     internal val conversionMutex = kotlinx.coroutines.sync.Mutex()
@@ -42,7 +51,7 @@ class UltraSlimApp : Application() {
 
     val database: AppDatabase by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         Room.databaseBuilder(this, AppDatabase::class.java, "ultraslim.db")
-            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4, AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6)
+            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4, AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6, AppDatabase.MIGRATION_6_7)
             .build()
     }
 
@@ -90,8 +99,10 @@ class UltraSlimApp : Application() {
             val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
             listOf("inputs", "outputs").forEach { folder ->
                 File(filesDir, folder).listFiles()?.forEach { file ->
-                    val uri = androidx.core.content.FileProvider.getUriForFile(this@UltraSlimApp, "$packageName.files", file).toString()
-                    if(file.lastModified() < cutoff && file.path !in referenced && uri !in referenced) file.delete()
+                    if (file.lastModified() < cutoff && file.path !in referenced) {
+                        val uri = androidx.core.content.FileProvider.getUriForFile(this@UltraSlimApp, "$packageName.files", file).toString()
+                        if (uri !in referenced) file.delete()
+                    }
                 }
             }
             app.ultraslim.convert.InputMetadataStore.cleanUnreferenced(this@UltraSlimApp, referenced, cutoff)
@@ -103,7 +114,10 @@ class UltraSlimApp : Application() {
         super.onTrimMemory(level)
         // Bitmap 在 native heap 上，不被系统即时回收；进程被判定为可杀之前清掉预览缓存，
         // 让后台进程有机会存活，磁盘缓存保留。
-        if (level >= TRIM_MEMORY_RUNNING_LOW) app.ultraslim.ui.components.PreviewCache.trimMemory()
+        if (level >= TRIM_MEMORY_RUNNING_LOW) {
+            app.ultraslim.ui.components.PreviewCache.trimMemory()
+            runCatching { coil3.SingletonImageLoader.get(this).memoryCache?.clear() }
+        }
     }
 
     private fun createNotificationChannel() {

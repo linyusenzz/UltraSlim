@@ -1,0 +1,106 @@
+name: Verify UltraSlim
+
+# Only repository-controlled branches run automatically. No pull_request event.
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 'Also build native dependencies and APKs on the dedicated macOS ARM64 runner'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Set build directory
+        shell: bash
+        run: echo "ULTRASLIM_BUILD_ROOT=$RUNNER_TEMP/ultraslim-quick" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - name: Install Android compile tools
+        shell: bash
+        run: |
+          sdkmanager --licenses >/dev/null < <(yes)
+          sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0' \
+            'platform-tools' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Check repository and Python regressions
+        run: |
+          python3 scripts/check_repository.py
+          python3 scripts/test_release_identity.py
+          python3 scripts/test_performance.py
+      - name: Run JVM tests and compile Android tests
+        shell: bash
+        run: |
+          unset ULTRASLIM_KEYSTORE ULTRASLIM_STORE_PASSWORD ULTRASLIM_KEY_ALIAS ULTRASLIM_KEY_PASSWORD
+          ./gradlew --no-daemon -Pkotlin.incremental=false \
+            :app:testDebugUnitTest :app:compileDebugAndroidTestKotlin
+      - name: Upload JVM reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultraslim-quick-reports
+          path: |
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/app/reports/**
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/app/test-results/**
+          retention-days: 7
+          if-no-files-found: ignore
+
+  full:
+    needs: quick
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.full &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/'))
+    runs-on: [self-hosted, macOS, ARM64, ultraslim]
+    timeout-minutes: 180
+    steps:
+      - name: Set build directory
+        shell: bash
+        run: echo "ULTRASLIM_BUILD_ROOT=$RUNNER_TEMP/ultraslim-full-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build native dependencies and verify
+        shell: bash
+        run: |
+          unset ULTRASLIM_KEYSTORE ULTRASLIM_STORE_PASSWORD ULTRASLIM_KEY_ALIAS ULTRASLIM_KEY_PASSWORD
+          export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+          export ANDROID_HOME="$HOME/Library/Android/sdk"
+          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
+          test -x "$JAVA_HOME/bin/java"
+          test -d "$ANDROID_HOME/ndk/27.2.12479018"
+          native/deps/build_deps.sh host
+          native/deps/build_deps.sh android arm64-v8a "$ANDROID_HOME/ndk/27.2.12479018" 26
+          scripts/verify.sh
+          ./gradlew --no-daemon -Pkotlin.incremental=false \
+            :app:assembleBenchmark :app:assembleBaseline :benchmark:assembleBenchmark :benchmark:assembleBaseline
+      - name: Upload APKs and verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultraslim-full-artifacts
+          path: |
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/app/outputs/apk/**
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/benchmark/outputs/apk/**
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/app/reports/**
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/app/test-results/**
+            ${{ env.ULTRASLIM_BUILD_ROOT }}/host-test/Testing/**
+          retention-days: 7
+          if-no-files-found: ignore

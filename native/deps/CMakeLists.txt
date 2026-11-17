@@ -80,8 +80,7 @@ ExternalProject_Add(x265
     SOURCE_SUBDIR source
     PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/patches/patch_x265.sh <SOURCE_DIR> "${X265_ASM_INJECT}"
     CMAKE_ARGS ${COMMON_CMAKE_ARGS}
-               -DCMAKE_C_FLAGS=${X265_ARM_FLAGS}
-               -DCMAKE_CXX_FLAGS=${X265_ARM_FLAGS}
+               -DULTRASLIM_EXTRA_FLAGS=${X265_ARM_FLAGS}
                -DENABLE_ASSEMBLY=${X265_ENABLE_ASSEMBLY}
                -DULTRASLIM_ARM_INTRINSICS=ON
                -DENABLE_SHARED=OFF
@@ -92,7 +91,7 @@ ExternalProject_Add(x265
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel
     INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config Release)
 
-# ---------------------------------------------------------------- aom (AV1 decoder + lossless 4:4:4 gain map encoder)
+# ---------------------------------------------------------------- aom (AV1 8-bit 4:4:4 gain map & odd-HDR encoder; decoding uses dav1d)
 ExternalProject_Add(aom
     URL https://storage.googleapis.com/aom-releases/libaom-3.12.1.tar.gz
     URL_HASH SHA256=9e9775180dec7dfd61a79e00bda3809d43891aee6b2e331ff7f26986207ea22e
@@ -103,7 +102,8 @@ ExternalProject_Add(aom
                -DENABLE_TOOLS=0
                -DENABLE_NASM=0
                -DCONFIG_AV1_ENCODER=1
-               -DCONFIG_AV1_DECODER=1
+               -DCONFIG_AV1_DECODER=0
+               -DCONFIG_AV1_HIGHBITDEPTH=0
                -DCONFIG_MULTITHREAD=1
                -DCONFIG_WEBM_IO=0
                -DCONFIG_LIBYUV=0

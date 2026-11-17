@@ -275,13 +275,25 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     fun importFolder(tree: Uri, includeSubfolders: Boolean = true, ignoreLivePhotos: Boolean = false) {
         launchImport {
             // Providers without persistent grants fall back to InputStore's durable private copy.
-            withContext(Dispatchers.IO) {
+            val hasTreeGrant = withContext(Dispatchers.IO) {
                 runCatching { app.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                android.provider.DocumentsContract.isTreeUri(tree) &&
+                    app.contentResolver.persistedUriPermissions.any { grant ->
+                        grant.isReadPermission && grant.uri.authority == tree.authority &&
+                            android.provider.DocumentsContract.isTreeUri(grant.uri) &&
+                            android.provider.DocumentsContract.getTreeDocumentId(grant.uri) ==
+                            android.provider.DocumentsContract.getTreeDocumentId(tree)
+                    }
             }
             val unreadable = java.util.concurrent.atomic.AtomicInteger()
-            val result = importImages(FolderImages.images(app.contentResolver, tree, includeSubfolders) {
+            val result = importImages(FolderImages.entries(app.contentResolver, tree, includeSubfolders) {
                 unreadable.incrementAndGet()
-            }.map { ImportImage(it) }, ignoreLivePhotos)
+            }.map { entry ->
+                val meta = if (!entry.displayName.isNullOrBlank() && entry.sizeBytes > 0L) {
+                    entry.displayName to entry.sizeBytes
+                } else null
+                ImportImage(entry.uri, meta, hasTreeGrant = hasTreeGrant)
+            }, ignoreLivePhotos)
             result.message() + if (unreadable.get() > 0) "；${unreadable.get()} 个子文件夹无法读取" else ""
         }
     }
@@ -354,7 +366,11 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
         launchImport { importImages(albumImages(album.id), ignoreLivePhotos).message() }
     }
 
-    private data class ImportImage(val uri: Uri, val metadata: Pair<String, Long>? = null)
+    private data class ImportImage(
+        val uri: Uri,
+        val metadata: Pair<String, Long>? = null,
+        val hasTreeGrant: Boolean = false,
+    )
 
     private data class ImportResult(
         val added: Int = 0,
@@ -415,7 +431,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
                     val id = UUID.randomUUID().toString()
                     val durable = withContext(Dispatchers.IO) {
                         val importContext = coroutineContext
-                        InputStore.persist(app, uri, id) { importContext.ensureActive() }
+                        InputStore.persist(app, uri, id, hasTreeGrant = image.hasTreeGrant) { importContext.ensureActive() }
                     }
                     pending += QueueItem(id = id, uri = durable.toString(), displayName = name,
                         sizeBytes = size, createdAt = importTime)
@@ -568,15 +584,13 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     }.flowOn(Dispatchers.IO)
 
     private suspend fun probeHasGainMap(uri: Uri): Boolean = probePermits.withPermit {
-        ImageWork.run {
-            val probe = runCatching {
-                app.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                    UltraHdrBridge.nativeProbe(pfd.fd)
-                }
-            }.getOrNull()
-            if (probe != null && probe.isSuccess && probe.hasGainMap) scannedProbes[uri.toString()] = probe
-            probe != null && probe.isSuccess && probe.hasGainMap
+        val probe = withContext(Dispatchers.IO) {
+            runCatching { app.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+        }?.use { pfd ->
+            ImageWork.run { runCatching { UltraHdrBridge.nativeProbe(pfd.fd) }.getOrNull() }
         }
+        if (probe != null && probe.isSuccess && probe.hasGainMap) scannedProbes[uri.toString()] = probe
+        probe != null && probe.isSuccess && probe.hasGainMap
     }
 
     /** Applies a named bundle of conversion parameters. */
@@ -685,6 +699,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     fun setKeepLocation(v: Boolean) = change { it.copy(keepLocation = v) }
     fun setAvifGainmapCompatibility(v: Boolean) = change { it.copy(avifGainmapCompatibility = v) }
     fun setHeicGainmapCompatibility(v: Boolean) = change { it.copy(heicGainmapCompatibility = v) }
+    fun setJxlJpegReconstruction(v: Boolean) = change { it.copy(jxlJpegReconstruction = v) }
     fun setAllowSdr(v: Boolean) = change { it.copy(allowSdr = v) }
     fun setAutoSave(v: Boolean) = change { it.copy(autoSave = v, autoReplaceOriginals = it.autoReplaceOriginals && v) }
     fun setOnlySmaller(v: Boolean) = change { it.copy(onlySmaller = v) }
@@ -721,12 +736,10 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     }
 
     private suspend fun probeUri(uri: Uri) = probePermits.withPermit {
-        scannedProbes.remove(uri.toString()) ?: ImageWork.run {
-            runCatching {
-                app.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                    UltraHdrBridge.nativeProbe(pfd.fd)
-                }
-            }.getOrNull()
+        scannedProbes.remove(uri.toString()) ?: withContext(Dispatchers.IO) {
+            runCatching { app.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+        }?.use { pfd ->
+            ImageWork.run { runCatching { UltraHdrBridge.nativeProbe(pfd.fd) }.getOrNull() }
         }
     }
 

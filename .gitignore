@@ -28,6 +28,7 @@ __pycache__/
 /build/
 /build-*/
 /app/build/
+/benchmark/build/
 /native/deps/build/
 /native/prefix/
 /apple-live/.build/

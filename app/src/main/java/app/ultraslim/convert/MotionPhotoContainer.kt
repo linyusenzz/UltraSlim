@@ -248,7 +248,10 @@ internal object MotionPhotoContainer {
         val start = old?.start ?: 2
         val end = old?.end ?: start
         val delta = marker.size - (end - start)
-        val result = bytes.copyOfRange(0, start) + marker + bytes.copyOfRange(end, bytes.size)
+        val result = ByteArray(bytes.size + delta)
+        System.arraycopy(bytes, 0, result, 0, start)
+        System.arraycopy(marker, 0, result, start, marker.size)
+        System.arraycopy(bytes, end, result, start + marker.size, bytes.size - end)
         fun shifted(pos: Int) = if (pos >= end) pos + delta else pos
         val original = ByteBuffer.wrap(bytes).order(order)
         val updated = ByteBuffer.wrap(result).order(order)
@@ -266,13 +269,19 @@ internal object MotionPhotoContainer {
 
     fun copyVideo(channel: FileChannel, info: MotionPhotoInfo, output: OutputStream) {
         require(validVideo(channel, info.videoOffset, info.videoLength)) { "实况视频不完整" }
+        val buffer = ByteBuffer.allocate(128 * 1024)
         var offset = info.videoOffset
         var remaining = info.videoLength
         while (remaining > 0) {
-            val bytes = read(channel, offset, minOf(65536L, remaining).toInt())
-            output.write(bytes)
-            offset += bytes.size
-            remaining -= bytes.size
+            buffer.clear()
+            buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
+            while (buffer.hasRemaining()) {
+                if (channel.read(buffer, offset + buffer.position()) <= 0) throw EOFException("实况视频读取不完整")
+            }
+            val n = buffer.position()
+            output.write(buffer.array(), 0, n)
+            offset += n
+            remaining -= n
         }
     }
 }

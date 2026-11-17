@@ -19,6 +19,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
@@ -33,8 +34,13 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.ultraslim.convert.MediaStoreTrashHelper
 import app.ultraslim.convert.OutputStore
@@ -52,9 +58,19 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
     val state by vm.uiState.collectAsStateWithLifecycle()
     val deleting by vm.deleteCandidates.collectAsStateWithLifecycle()
     val trashableOriginals by vm.trashableOriginals.collectAsStateWithLifecycle()
+    val selection by vm.selection.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val listState = rememberLazyListState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, vm) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) vm.refreshOriginals()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     // rememberSaveable：进详情再返回（或深色模式切换）后筛选/选择/折叠不丢。
     var filter by rememberSaveable { mutableStateOf("全部") }
     var selected by rememberSaveable(
@@ -69,6 +85,22 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
     var lastTrashCount by remember { mutableIntStateOf(0) }
     LaunchedEffect(filter) { vm.setFilter(historyFilterSaveState(filter)) }
     LaunchedEffect(selecting) { onSelectingChange(selecting) }
+    LaunchedEffect(selected) { vm.setSelectedIds(selected) }
+    // Only a completed lookup for this exact selection may remove deleted IDs. Window
+    // changes never clear a selection; all actions use fresh records fetched by ID.
+    LaunchedEffect(selection, filter) {
+        if (selection.ids == selected) {
+            selected = selected.intersect(selection.items.filter { it.matchesHistoryFilter(filter) }
+                .mapTo(mutableSetOf()) { it.id })
+        }
+    }
+    var shownWindowKey by rememberSaveable { mutableStateOf(state.windowKey) }
+    LaunchedEffect(state.windowKey) {
+        if (shownWindowKey != state.windowKey) {
+            shownWindowKey = state.windowKey
+            listState.scrollToItem(0)
+        }
+    }
     val trashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             vm.onSelectedOriginalsTrashed(lastTrashCount)
@@ -81,11 +113,17 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
     }
     LaunchedEffect(vm) { vm.events.collect { snackbar.showSnackbar(it) } }
     val visible = remember(state.items, filter) { state.items.filter { it.matchesHistoryFilter(filter) } }
-    val selectedItems = remember(visible, selected) { visible.filter { it.id in selected } }
+    // Visible rows make a new tap immediately actionable; off-window rows are kept by the
+    // ID lookup until the next selection result arrives. Never act on a partial selection.
+    val selectedItems = remember(visible, selection.items, selected, filter) {
+        (selection.items + visible).associateBy { it.id }.values.filter {
+            it.id in selected && it.matchesHistoryFilter(filter)
+        }
+    }
+    val selectionReady = selectedItems.size == selected.size
     val pendingCount = remember(selectedItems) { selectedItems.count { it.saveState != "SAVED" } }
-    LaunchedEffect(visible) {
-        selected = selected.intersect(visible.map { it.id }.toSet())
-        vm.ensureTrashableResolved(visible)
+    LaunchedEffect(visible, selectedItems) {
+        vm.ensureTrashableResolved((visible + selectedItems).distinctBy { it.id })
     }
     val groups = remember(visible) { visible.groupBy { historyDate(it.createdAt) } }
     val railMode = NavigationSuiteScaffoldDefaults.navigationSuiteType(currentWindowAdaptiveInfoV2()) == NavigationSuiteType.WideNavigationRailCollapsed
@@ -96,7 +134,7 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
         topBar = {
             TopAppBar(colors = appTopBarColors(), scrollBehavior = if (selecting) null else scrollBehavior, title = {
                 Column {
-                    Text(if (selecting) "已选择 ${selectedItems.size} 张" else "成品库", style = MaterialTheme.typography.titleLarge)
+                    Text(if (selecting) "已选择 ${selected.size} 张" else "成品库", style = MaterialTheme.typography.titleLarge)
                     Text(if (selecting) "点击图片勾选，可批量分享或删除" else "每一次减负，都看得见",
                         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -108,8 +146,10 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                 Box {
                     IconButton(onClick = { menu = true }, enabled = !state.busyNow) { Icon(Icons.Rounded.MoreVert, "历史操作") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        if (selecting) DropdownMenuItem(text = { Text("删除所选记录") }, enabled = selectedItems.isNotEmpty(),
-                            onClick = { menu = false; vm.requestDelete(selectedItems.map { it.id }.toSet()) })
+                        DropdownMenuItem(text = { Text("刷新原图状态") },
+                            onClick = { menu = false; vm.refreshOriginals() })
+                        if (selecting) DropdownMenuItem(text = { Text("删除所选记录") }, enabled = selectionReady && selectedItems.isNotEmpty(),
+                            onClick = { menu = false; vm.requestDelete(selected) })
                         else DropdownMenuItem(text = { Text("清空历史记录") }, enabled = state.items.isNotEmpty(),
                             onClick = { menu = false; confirmClear = true })
                     }
@@ -126,7 +166,7 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                         .padding(horizontal = 16.dp, vertical = 8.dp)) {
                         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (pendingCount > 0 && android.os.Build.VERSION.SDK_INT >= 29) {
-                                Button(onClick = { vm.saveSelected(selectedItems.map { it.id }.toSet()) }, enabled = !state.busyNow) {
+                                Button(onClick = { vm.saveSelected(selected) }, enabled = !state.busyNow && selectionReady) {
                                     Text(if (state.busyNow) "处理中…" else "保存 $pendingCount 张")
                                 }
                             }
@@ -137,11 +177,11 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                                         onClick = {
                                             lastTrashCount = trashableCount
                                             scope.launch {
-                                                val sender = vm.requestTrashSelected(selectedItems.map { it.id }.toSet())
+                                                val sender = vm.requestTrashSelected(selected)
                                                 if (sender != null) trashLauncher.launch(IntentSenderRequest.Builder(sender).build())
                                             }
                                         },
-                                        enabled = !state.busyNow,
+                                        enabled = !state.busyNow && selectionReady,
                                     ) {
                                         Icon(Icons.Rounded.DeleteSweep, null, modifier = Modifier.size(16.dp))
                                         Spacer(Modifier.width(4.dp))
@@ -151,9 +191,9 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                             }
                             OutlinedButton(onClick = {
                                 if (!OutputStore.share(context, selectedItems)) scope.launch { snackbar.showSnackbar("分享失败，文件不可访问") }
-                            }, enabled = !state.busyNow && selectedItems.isNotEmpty()) { Text("分享") }
-                            OutlinedButton(onClick = { vm.requestDelete(selectedItems.map { it.id }.toSet()) },
-                                enabled = !state.busyNow && selectedItems.isNotEmpty()) { Text("删除记录") }
+                            }, enabled = !state.busyNow && selectionReady && selectedItems.isNotEmpty()) { Text("分享") }
+                            OutlinedButton(onClick = { vm.requestDelete(selected) },
+                                enabled = !state.busyNow && selectionReady && selectedItems.isNotEmpty()) { Text("删除记录") }
                         }
                     }
                 }
@@ -161,7 +201,9 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
         }
     ) { padding ->
         AdaptiveWorkspace(modifier = Modifier.padding(padding).consumeWindowInsets(padding), primary = { expanded ->
-        LazyColumn(Modifier.fillMaxSize().testTag("history-list"),
+        LazyColumn(Modifier.fillMaxSize().testTag("history-list").semantics {
+            stateDescription = "已显示 ${state.items.size} 条记录"
+        }, state = listState,
             contentPadding = PaddingValues(start = 20.dp, top = 20.dp, end = 20.dp,
                 bottom = 20.dp + if (!selecting) WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() else 0.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -176,7 +218,8 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                 if (selecting) {
                     val allSelected = visible.isNotEmpty() && visible.all { it.id in selected }
                     TextButton(enabled = !state.busyNow && visible.isNotEmpty(), onClick = {
-                        selected = if (allSelected) emptySet() else visible.map { it.id }.toSet()
+                        val visibleIds = visible.mapTo(mutableSetOf()) { it.id }
+                        selected = if (allSelected) selected - visibleIds else selected + visibleIds
                     }) { Text(if (allSelected) "取消全选" else "全选当前页") }
                 } else if (visible.isNotEmpty()) {
                     Row(
@@ -201,6 +244,12 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                             }
                         }
                     }
+                }
+            }
+            if (state.olderWindow) item(key = "history-window-navigation") {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TextButton(onClick = vm::showNewer, enabled = !state.busyNow && !state.loadingPage) { Text("查看较新记录") }
+                    TextButton(onClick = vm::showLatest, enabled = !state.busyNow && !state.loadingPage) { Text("返回最新记录") }
                 }
             }
             if (visible.isEmpty()) item { EmptyState(Icons.Rounded.History, "暂无此类记录", "完成的成品和保存状态会显示在这里") }
@@ -284,8 +333,11 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                     }
                 }
             }
-            if (state.items.size < state.convertedCount) item {
-                TextButton(onClick = vm::loadMore, modifier = Modifier.fillMaxWidth()) { Text("加载更多记录") }
+            if (state.hasMore || state.loadingPage) item(key = "history-load-more") {
+                TextButton(onClick = vm::loadMore, enabled = !state.busyNow && !state.loadingPage,
+                    modifier = Modifier.fillMaxWidth()) {
+                    Text(if (state.loadingPage) "正在加载…" else if (state.atWindowLimit) "查看更早记录" else "加载更多记录")
+                }
             }
         }
         }, secondary = {
@@ -320,8 +372,9 @@ internal fun HistoryRow(entity: HistoryEntity, selecting: Boolean, checked: Bool
         colors = CardDefaults.cardColors(containerColor = if (checked) MaterialTheme.colorScheme.secondaryContainer else if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow)) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             if (selecting) Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+            val thumbMaxDim = app.ultraslim.ui.components.rememberThumbMaxDim()
             UltraAsyncImage(entity.outputUri, null, ContentScale.Crop, Modifier.padding(start = if (selecting) 8.dp else 0.dp)
-                .size(72.dp).clip(RoundedCornerShape(14.dp)), 128)
+                .size(72.dp).clip(RoundedCornerShape(14.dp)), thumbMaxDim)
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(entity.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
                 Text("${entity.format} · ${entity.width} × ${entity.height}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

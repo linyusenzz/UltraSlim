@@ -67,11 +67,36 @@ interface HistoryDao {
     fun flowPage(limit: Int, filter: String): Flow<List<HistoryEntity>> =
         if (filter.isEmpty()) flowPageAll(limit) else flowPageFiltered(limit, filter)
 
-    @Query("SELECT * FROM history ORDER BY createdAt DESC LIMIT :limit")
+    @Query("SELECT * FROM history ORDER BY createdAt DESC, id DESC LIMIT :limit")
     fun flowPageAll(limit: Int): Flow<List<HistoryEntity>>
 
-    @Query("SELECT * FROM history WHERE saveState = :filter ORDER BY createdAt DESC LIMIT :limit")
+    @Query("SELECT * FROM history WHERE saveState = :filter ORDER BY createdAt DESC, id DESC LIMIT :limit")
     fun flowPageFiltered(limit: Int, filter: String): Flow<List<HistoryEntity>>
+
+    // A bounded keyset window does not grow with the number of pages the user has visited.
+    // Include the primary key in the cursor: a batch can contain many equal timestamps.
+    @Query("SELECT * FROM history WHERE createdAt <= :beforeTime AND " +
+        "(createdAt < :beforeTime OR id < :beforeId) ORDER BY createdAt DESC, id DESC LIMIT :limit")
+    suspend fun windowAll(beforeTime: Long, beforeId: Long, limit: Int): List<HistoryEntity>
+
+    @Query("SELECT * FROM history WHERE saveState = :filter AND createdAt <= :beforeTime AND " +
+        "(createdAt < :beforeTime OR id < :beforeId) ORDER BY createdAt DESC, id DESC LIMIT :limit")
+    suspend fun windowFiltered(filter: String, beforeTime: Long, beforeId: Long, limit: Int): List<HistoryEntity>
+
+    @Query("SELECT COUNT(*) FROM history")
+    suspend fun countAll(): Int
+
+    @Query("SELECT COUNT(*) FROM history WHERE saveState = :filter")
+    suspend fun countFiltered(filter: String): Int
+
+    @Transaction
+    suspend fun window(filter: String, beforeTime: Long, beforeId: Long, limit: Int): HistoryPage {
+        val boundedLimit = limit.coerceIn(1, 500)
+        val rows = if (filter.isEmpty()) windowAll(beforeTime, beforeId, boundedLimit + 1)
+            else windowFiltered(filter, beforeTime, beforeId, boundedLimit + 1)
+        val count = if (filter.isEmpty()) countAll() else countFiltered(filter)
+        return HistoryPage(rows.take(boundedLimit), count, rows.size > boundedLimit)
+    }
 
     // Only batch settings are needed to decide whether automatic publication is pending.
     // Observe batches too, so cancellation wakes both publication and replacement review.
@@ -104,6 +129,9 @@ interface HistoryDao {
 
     @Query("SELECT * FROM history")
     suspend fun all(): List<HistoryEntity>
+
+    @Query("SELECT id FROM history")
+    suspend fun allIds(): List<Long>
 
     /** Startup cleanup only needs references, not every image's metadata. */
     @Query("SELECT id, inputUri, outputUri FROM history")
@@ -158,6 +186,8 @@ interface HistoryDao {
 
 data class HistoryPaths(val id: Long, val inputUri: String, val outputUri: String)
 
+data class HistoryPage(val items: List<HistoryEntity>, val totalCount: Int, val hasMore: Boolean)
+
 data class PendingPublicationBatch(val batchId: String, val settings: String)
 
 private const val HISTORY_STATS_SQL = "SELECT COUNT(*) as countDone, COALESCE(SUM(inputBytes), 0) as totalInputBytes, COALESCE(SUM(outputBytes), 0) as totalOutputBytes, COALESCE(SUM(CASE WHEN hadGainMap THEN 1 ELSE 0 END), 0) as gainmapCount FROM history WHERE status = 'DONE'"
@@ -196,7 +226,7 @@ interface TaskDao {
     @Query("UPDATE batches SET cancelled = 1 WHERE id = :id") suspend fun cancel(id: String)
 }
 
-@Database(entities = [HistoryEntity::class, QueueItem::class, BatchEntity::class, ReplacementEntity::class], version = 6, exportSchema = true)
+@Database(entities = [HistoryEntity::class, QueueItem::class, BatchEntity::class, ReplacementEntity::class], version = 7, exportSchema = true)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun historyDao(): HistoryDao
     abstract fun taskDao(): TaskDao
@@ -211,6 +241,22 @@ abstract class AppDatabase : RoomDatabase() {
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_history_saveState_createdAt ON history(saveState, createdAt)")
+            }
+        }
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Room 对非空内嵌字段直接读取 SQLite 值，不会用 Kotlin 构造器默认值兜底 NULL。
+                db.execSQL("""
+                    UPDATE tasks SET
+                        result_hasGainMap = COALESCE(result_hasGainMap,
+                            CASE WHEN result_errorCode = 0 THEN COALESCE(result_inputHadGainMap, 0) ELSE 0 END),
+                        result_hasExif = COALESCE(result_hasExif,
+                            (SELECT hasExif FROM history WHERE history.id = tasks.historyId), 0),
+                        result_maxContentBoost = COALESCE(result_maxContentBoost,
+                            (SELECT maxContentBoost FROM history WHERE history.id = tasks.historyId), 1.0)
+                    WHERE result_errorCode IS NOT NULL
+                      AND (result_hasGainMap IS NULL OR result_hasExif IS NULL OR result_maxContentBoost IS NULL)
+                """.trimIndent())
             }
         }
         val MIGRATION_1_2 = object : Migration(1, 2) {

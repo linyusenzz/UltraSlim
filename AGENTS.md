@@ -9,7 +9,7 @@
   - `jni/transcode.cpp` — 转码核心（平台无关）：probe + JPEG/HEIC/AVIF/JXL → JPEG/HEIC/AVIF/JXL（HDR 路径走 libultrahdr + ISO 21496-1 jhgm/tmap，SDR 路径走直编码；支持速度档位 speedLevel 0/1/2、分辨率缩放 resizePercent）
   - `jni/ultraslim_jni.cpp` — JNI 桥接（`app.ultraslim.bridge.UltraHdrBridge`）
   - `CMakeLists.txt` — App 原生构建（Gradle externalNativeBuild 入口；`ULTRASLIM_HOST_TEST=ON` 时构建主机测试程序）
-  - `deps/` — 依赖超级构建：libjpeg-turbo 3.1.1 / x265 4.1 / aom 3.12.1(仅解码) / SVT-AV1 3.0.0(AV1 编码) / libde265 1.0.16 / libheif(4a3f74bc + ISO 21496-1 gain map patch) / libjxl 0.11.1 (含 highway, brotli, skcms)
+  - `deps/` — 依赖超级构建：libjpeg-turbo 3.1.1 / x265 4.1 / aom 3.12.1（8-bit 编码） / SVT-AV1 3.0.0(AV1 编码) / libde265 1.0.16 / libheif(4a3f74bc + ISO 21496-1 gain map patch) / libjxl 0.11.1 (含 highway, brotli, skcms)
 - `third_party/libultrahdr` — 官方 google/libultrahdr v2.0.2（vendored，基线 `e5f5a022`）；来源与 5 个本地修改文件见 `third_party/libultrahdr/ULTRASLIM_UPSTREAM.md`。不是独立 Git 仓库。
 - `native/prefix/<flavor>/` — 依赖产物（`host`、`android-arm64-v8a`），被 .gitignore 忽略
 
@@ -77,7 +77,7 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - probe 次数收敛：`transcodeImage` 的输入 probe 把已初始化的 uhdr decoder 直接移交 `transcodeUnchecked`（JXL 分支复用 probe 结果，SDR 不再建 decoder）；rebuild 路径从内存缓冲校验输出，不再整读输出文件；`TranscodeResult` 携带 hasGainMap/hasExif/maxContentBoost，worker 不再对输出做第二次 probe。preserve 路径的输出元数据由 `tryReuseGainMap` 直接报告。
 - 所有解码路径共享 1 亿像素上限 `kMaxPixels`（JXL 此前缺失）；JXL box 上限为 `kMaxBoxBytes`。
 - 批次快照解析（decodeDefaults/JSONArray）必须容错：旧快照缺字段按默认值，损坏批次显式置 FAILED，不得在 checkpoint 循环外抛异常静默死亡。仅两个兼容开关例外：缺字段按 false（像素精确语义）。
-- Room 迁移加列的写法：带 Kotlin 默认值的字段（如 TranscodeResult 的新字段），期望 schema 是**可空且无 DEFAULT**（读 NULL 回退 Kotlin 默认值）；写 `NOT NULL DEFAULT 0` 会过不了迁移校验、真机升级即崩。此缺陷只有设备测试能拦——JVM 单测与 host ctest 都覆盖不到。
+- Room 迁移加列的写法：带 Kotlin 默认值的字段（如 TranscodeResult 的新字段），期望 schema 是**可空且无 DEFAULT**。数据库 v7 的 6→7 迁移对已有转码结果显式回填缺失字段，Room 不会自动使用 Kotlin 默认值；写 `NOT NULL DEFAULT 0` 会过不了迁移校验、真机升级即崩。此缺陷只有设备测试能拦——JVM 单测与 host ctest 都覆盖不到。
 - 前台服务 API 35+ 用 `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING`（manifest 同时声明 dataSync|mediaProcessing）；`setForeground` 失败只标记未完成项；温控重试有指数退避与 8 次上限，超限停回 READY 等手动继续。
 - 历史页展开态按行虚拟化（每条记录独立 LazyColumn item，折叠态不发射行）；首页队列流经 150ms 采样后再进 UI 状态；回收站原图解析（逐条 MediaStore 查询）只在 Default 线程做，组合期只读缓存。
 - HDR 扫描（整库/相册）经 `probePermits` 并发（4 路），probe 是轻量头部解析不是编码；PreviewCache 解码在 diskLock 之外、原生解码槽位 2。转码写盘路径必须检查 flush/close（stdio 缓冲写失败到 close 才暴露），readAll/writeAll 对 EINTR 重试。`apple-live` 本机跑 `swift test` 必须外置 scratch 目录（`--scratch-path /tmp/...`），iCloud 同步目录的 FileProvider xattr 会让 codesign 拒绝测试包；native/deps 依赖声明必须带 URL_HASH（改版本时重新计算 SHA256）。
@@ -115,3 +115,10 @@ build/host-test/transcode_test <输入图片> <输出.heic|.avif> [quality=90] [
 - 已实测并否决的伪优化，勿重复尝试：容器重复解析（单次 0.01–0.03ms，占 26MP 整次转码 2126ms 的 0.002%；且 HEIF 的「双解析」是 `hasExif` 的唯一来源，`uhdr_dec_get_exif` 对 HEIF/AVIF 返回 null）；`parallelRows` 进程级线程池（spawn+join 0.03ms/次）；依赖库 LTO。
 - 构建路径脱敏：`native/CMakeLists.txt` 的 `-ffile-prefix-map` 必须先用 `get_filename_component(... REALPATH)` 把 `${CMAKE_CURRENT_SOURCE_DIR}/..` 归一到仓库根再映射——字面量 `.../native/..` 不是 `.../third_party/libultrahdr/...` 的文本前缀，否则 vendored 源码的 `__FILE__`（assert 串）会残留构建机绝对路径。
 - 2026-10-17 批次完整数据、验证结论与仍未立项的缺口见 [docs/TODO-optimizations.md](docs/TODO-optimizations.md) 与 [docs/reports/2026-10-17-optimization-batch.md](docs/reports/2026-10-17-optimization-batch.md)。
+
+## JXL 保留 JPEG 重建与优化批次（2026-11-18）
+
+- **JXL 保留 JPEG 重建（`jxlJpegReconstruction`）**：默认 `false`（快照缺字段按 `false`）。仅当输出格式为 JXL 且源容器为 JPEG（`container == 0`，同时支持纯 SDR JPEG 与 Ultra HDR 增益图 JPEG）时生效；非 JPEG 源（HEIC/AVIF/JXL）回退常规 JXL 编码，不支持无损 DCT 转码的非常规 JPEG（算术编码/CMYK 等）明确报 `errorCode = 31` 并 `ftruncate(outFd, 0)`。开启时忽略主图有损画质与分辨率缩放，经 `JpegScanner` 截取精确 `[0, firstEoi)` 主图码流后走 `JxlEncoderUseContainer(JXL_TRUE)` + `JxlEncoderStoreJPEGMetadata(JXL_TRUE)` + `JxlEncoderAddJPEGFrame`；HDR JPEG 的 `jhgm` box **必须**在 `JxlEncoderCloseFrames` **之后**追加（libjxl 要求 `jbrd` 先于自定义 box，否则 `AddBox` 失败）。EXIF/GPS 策略在不重编码 DCT 扫描的前提下执行：全保留时主图字节逐位不变（可 SHA-256 逐字节还原 JPEG）；去定位时检查各段 EXIF 的 GPS IFD（`0x8825`），并移除可能保存位置的标准及扩展 XMP、APP13；关闭保留 EXIF 时剔除 Exif APP1，若 `Orientation != 1` 则注入最小 32B 方向 APP1 以保持显示朝向与重建一致。
+- **JXL 方向语义修正**：ISO/IEC 18181-2 规定 `JxlDecoder` 默认已自动应用 codestream orientation，解码后的像素不得在 `transcodeUnchecked` / `decodePreviewInternal` 二次调用 `orientPixels`（仅 `container == 0` 的 libjpeg 解码需手动旋转）。
+- **原生内存、并行与流式 I/O**：单通道增益图使用 `SdrImage::gray` 单字节平面（省 75% 增益图像素内存）；`tryReuseGainMap` 先释放 `uhdr_decoder` 再建 `heif_context`，先转换并释放主图 `rgba` 再解码延迟的 `gmBytes`；`orientPixels` 分块/行级并行化，`copyNativeGainMap` 与 `resizeRgbaPlane`（定点双线性）补齐 ARM NEON；JPEG 预览改走 64KiB `pread` 流式源 `decodeJpegSdrFd`，JPEG 动态照片探测遇到紧随主图 `EOI` 的 ISO-BMFF `ftyp`/`mpvd` 立即早退，转码 `readAll` 按 `maxInputBytes`（`videoOffset`）仅读静态图前缀。
+- **预览零重编解码与保存/替换批处理**：新增 `nativeDecodePreviewBitmap` 经 `jnigraphics` 直接填充 `Bitmap` 并设置 P3/BT.2020 `ColorSpace`，`UltraAsyncImage` 对原生解码就绪态（含 JXL）直接渲染而不经磁盘 JPEG 二次编解码；缩略图池使用 `RGB_565`；`ImageWork` 槽位外置 `openFileDescriptor` 与磁盘缓存写盘；`HdrOutputValidation`/`SdrOutputValidation` 采样目标边长收敛至 512（仅 SDR 启用 `MEMORY_POLICY_LOW_RAM`，HDR 保持硬件/全精度以防误伤 gainmap）；`DeferredOutputHost` 批量合并 `batch()` 查询与 `updateAll`，`AutoReplacementHost` 3 路并发校验并预取原图状态；Apple Live ZIP 与 macOS `HEICPairing` 改为流式写出。

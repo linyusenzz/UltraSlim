@@ -249,6 +249,183 @@ class ConversionRepositoryTest {
         } finally { fixture.close() }
     }
 
+    @Test(timeout = 10_000)
+    fun startupRecoveryPersistsOnlyInterruptedRows() = runBlocking {
+        val initial = listOf(item("ready").copy(status = QueueStatus.READY),
+            item("probing").copy(status = QueueStatus.PROBING),
+            item("active").copy(status = QueueStatus.CONVERTING))
+        val fixture = Fixture(initial)
+        try {
+            fixture.repo.awaitReady()
+            fixture.repo.flush()
+            assertEquals(initial.map { it.id }, fixture.repo.queue.value.map { it.id })
+            assertTrue(fixture.repo.queue.value.all { it.status == QueueStatus.READY })
+            assertEquals(listOf("probing", "active"), fixture.dao.writes.single().first.map { it.id })
+            assertSame(initial.first(), fixture.repo.find("ready"))
+            assertTrue(fixture.repo.find("active")!!.error!!.contains("中断"))
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun indexesFollowUndoUriChangesAndBulkRemovalWithoutMutatingOldSnapshots() = runBlocking {
+        val fixture = Fixture(listOf("a", "b", "c", "d").map(::item))
+        try {
+            val repo = fixture.repo
+            val initial = repo.queue.value
+            val removed = repo.remove("b")!!
+            val afterRemove = repo.queue.value
+            repo.updateByUri("content://c") { it.copy(uri = "content://renamed", progress = 10) }
+            repo.updateByUri("content://c") { error("Old URI index must be removed") }
+            repo.updateByUri("content://renamed") { it.copy(progress = 20) }
+            assertNotNull(repo.restore(removed))
+            assertEquals(listOf("a", "b", "c", "d"), repo.queue.value.map { it.id })
+            assertEquals(20, repo.find("c")!!.progress)
+            assertEquals(listOf("a", "b", "c", "d"), initial.map { it.id })
+            assertTrue(initial.all { it.progress == 0 })
+            assertEquals(listOf("a", "c", "d"), afterRemove.map { it.id })
+            assertEquals("content://c", afterRemove[1].uri)
+
+            // Neither duplicate IDs nor duplicate URIs may invalidate an index.
+            repo.addAll(listOf(item("b").copy(uri = "content://different"),
+                item("other").copy(uri = "content://renamed"), item("e"), item("e").copy(uri = "content://second")))
+            assertEquals(listOf("a", "b", "c", "d", "e"), repo.queue.value.map { it.id })
+            repo.removeIds(listOf("a", "d", "a"))
+            val visited = mutableListOf<String>()
+            repo.updateAll(listOf("e", "b", "c", "c")) { visited += it.id; it.copy(progress = 30) }
+            assertEquals(listOf("b", "c", "e"), visited)
+            assertTrue(listOf("b", "c", "e").all { repo.find(it)?.progress == 30 })
+            assertNull(repo.find("a"))
+            assertNull(repo.find("d"))
+            fixture.dispatcher.drain()
+            repo.flush()
+            assertEquals(repo.queue.value, fixture.dao.rows)
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun inFlightDeleteDoesNotConsumeARestoredRowsNewRevision() = runBlocking {
+        val fixture = Fixture(listOf(item("a"), item("b")))
+        val deletion = CompletableDeferred<Unit>()
+        val restoration = CompletableDeferred<Unit>()
+        fixture.dao.beforeWrite = { if (it == 1) deletion.await() else restoration.await() }
+        try {
+            val removed = fixture.repo.remove("a")!!
+            fixture.dispatcher.drain()
+            val firstFlush = async(start = CoroutineStart.UNDISPATCHED) { fixture.repo.flush() }
+            fixture.repo.restore(removed)
+            val secondFlush = async(start = CoroutineStart.UNDISPATCHED) { fixture.repo.flush() }
+            deletion.complete(Unit)
+            fixture.dispatcher.drain()
+            firstFlush.await()
+            assertFalse(secondFlush.isCompleted)
+            assertEquals(listOf("b"), fixture.dao.rows.map { it.id })
+            assertEquals(listOf("a", "b"), fixture.repo.queue.value.map { it.id })
+            restoration.complete(Unit)
+            fixture.dispatcher.drain()
+            secondFlush.await()
+            assertEquals(setOf("a", "b"), fixture.dao.rows.map { it.id }.toSet())
+            assertEquals(listOf("a"), fixture.dao.writes[0].second)
+            assertEquals(listOf("a"), fixture.dao.writes[1].first.map { it.id })
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun inFlightInsertThenDeleteMustRemoveTheCommittedRow() = runBlocking {
+        val fixture = Fixture(listOf(item("a")))
+        val insertion = CompletableDeferred<Unit>()
+        val deletion = CompletableDeferred<Unit>()
+        fixture.dao.beforeWrite = { if (it == 1) insertion.await() else deletion.await() }
+        try {
+            fixture.repo.addAll(listOf(item("b")))
+            fixture.dispatcher.drain()
+            fixture.repo.remove("b")
+            val flush = async(start = CoroutineStart.UNDISPATCHED) { fixture.repo.flush() }
+            insertion.complete(Unit)
+            fixture.dispatcher.drain()
+            assertFalse(flush.isCompleted)
+            assertEquals(setOf("a", "b"), fixture.dao.rows.map { it.id }.toSet())
+            deletion.complete(Unit)
+            fixture.dispatcher.drain()
+            flush.await()
+            assertEquals(listOf("a"), fixture.dao.rows.map { it.id })
+            assertEquals(listOf("b"), fixture.dao.writes[1].second)
+
+            fixture.repo.addAll(listOf(item("never-committed")))
+            fixture.repo.remove("never-committed")
+            fixture.dispatcher.drain()
+            fixture.repo.flush()
+            assertEquals("Insert and delete before capture need no transaction", 2, fixture.dao.writes.size)
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun revertingDuringAWriteStillPersistsTheReversion() = runBlocking {
+        val fixture = Fixture(listOf(item("a")))
+        val write = CompletableDeferred<Unit>()
+        fixture.dao.beforeWrite = { if (it == 1) write.await() }
+        try {
+            fixture.repo.update("a") { it.copy(progress = 10) }
+            fixture.dispatcher.drain()
+            fixture.repo.update("a") { it.copy(progress = 0) }
+            val flush = async(start = CoroutineStart.UNDISPATCHED) { fixture.repo.flush() }
+            write.complete(Unit)
+            fixture.dispatcher.drain()
+            flush.await()
+            assertEquals(listOf(10, 0), fixture.dao.writes.map { it.first.single().progress })
+            assertEquals(0, fixture.dao.rows.single().progress)
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun failedWriteRetainsNewerChangesDeletesAndRestoresForRetry() = runBlocking {
+        val fixture = Fixture(listOf(item("a"), item("remove"), item("unchanged")))
+        val failedWrite = CompletableDeferred<Unit>()
+        val retryWrite = CompletableDeferred<Unit>()
+        fixture.dao.beforeWrite = {
+            if (it == 1) { failedWrite.await(); error("disk unavailable") } else retryWrite.await()
+        }
+        try {
+            fixture.repo.update("a") { it.copy(progress = 10) }
+            fixture.dispatcher.drain()
+            val firstFlush = async(start = CoroutineStart.UNDISPATCHED) { runCatching { fixture.repo.flush() } }
+            val removed = fixture.repo.remove("a")!!
+            fixture.repo.restore(removed)
+            fixture.repo.update("a") { it.copy(progress = 20) }
+            fixture.repo.remove("remove")
+            fixture.repo.addAll(listOf(item("new")))
+            val retryFlush = async(start = CoroutineStart.UNDISPATCHED) { fixture.repo.flush() }
+            failedWrite.complete(Unit)
+            fixture.dispatcher.drain()
+            assertEquals("disk unavailable", firstFlush.await().exceptionOrNull()?.message)
+            assertFalse(retryFlush.isCompleted)
+            assertEquals(0, fixture.dao.rows.first().progress)
+            assertEquals(setOf("a", "new"), fixture.dao.writes[1].first.map { it.id }.toSet())
+            assertEquals(listOf("remove"), fixture.dao.writes[1].second)
+            retryWrite.complete(Unit)
+            fixture.dispatcher.drain()
+            retryFlush.await()
+            assertEquals(fixture.repo.queue.value, fixture.dao.rows)
+            assertEquals(20, fixture.repo.find("a")!!.progress)
+            fixture.repo.flush()
+            assertEquals(0, fixture.dispatcher.pending)
+        } finally { fixture.close() }
+    }
+
+    @Test(timeout = 10_000)
+    fun cancellingTheWriterFailsOutstandingFlushInsteadOfAcknowledgingIt() = runBlocking {
+        val fixture = Fixture(listOf(item("a")))
+        fixture.dao.beforeWrite = { CompletableDeferred<Unit>().await() }
+        try {
+            fixture.repo.update("a") { it.copy(progress = 10) }
+            fixture.dispatcher.drain()
+            val flush = async(start = CoroutineStart.UNDISPATCHED) { runCatching { fixture.repo.flush() } }
+            fixture.close()
+            assertTrue(flush.await().exceptionOrNull() is kotlinx.coroutines.CancellationException)
+            assertEquals(0, fixture.dao.rows.single().progress)
+            assertTrue(runCatching { fixture.repo.flush() }.isFailure)
+        } finally { fixture.close() }
+    }
+
     private fun item(id: String) = QueueItem(id, "content://$id", "$id.jpg", 100, createdAt = 1)
 
     private fun probe() = ProbeResult(0, "", false, 0, 8, 8, 0, 0, false, 1f, 1f)

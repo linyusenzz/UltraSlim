@@ -1,0 +1,492 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 7,
+    "identityHash": "241ea7c538180a0c57a31504dfcbc0fc",
+    "entities": [
+      {
+        "tableName": "history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `displayName` TEXT NOT NULL, `inputUri` TEXT NOT NULL, `outputUri` TEXT NOT NULL, `inputBytes` INTEGER NOT NULL, `outputBytes` INTEGER NOT NULL, `width` INTEGER NOT NULL, `height` INTEGER NOT NULL, `gainmapWidth` INTEGER NOT NULL, `gainmapHeight` INTEGER NOT NULL, `hadGainMap` INTEGER NOT NULL, `format` TEXT NOT NULL, `inputFormat` TEXT NOT NULL, `durationMs` REAL NOT NULL, `maxContentBoost` REAL NOT NULL, `createdAt` INTEGER NOT NULL, `status` TEXT NOT NULL, `taskId` TEXT, `batchId` TEXT NOT NULL, `saveState` TEXT NOT NULL, `settingsSummary` TEXT NOT NULL, `hasExif` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "inputUri",
+            "columnName": "inputUri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputUri",
+            "columnName": "outputUri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "inputBytes",
+            "columnName": "inputBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputBytes",
+            "columnName": "outputBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "width",
+            "columnName": "width",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "height",
+            "columnName": "height",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "gainmapWidth",
+            "columnName": "gainmapWidth",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "gainmapHeight",
+            "columnName": "gainmapHeight",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hadGainMap",
+            "columnName": "hadGainMap",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "format",
+            "columnName": "format",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "inputFormat",
+            "columnName": "inputFormat",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationMs",
+            "columnName": "durationMs",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "maxContentBoost",
+            "columnName": "maxContentBoost",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "taskId",
+            "columnName": "taskId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "batchId",
+            "columnName": "batchId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "saveState",
+            "columnName": "saveState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "settingsSummary",
+            "columnName": "settingsSummary",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hasExif",
+            "columnName": "hasExif",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_history_taskId",
+            "unique": true,
+            "columnNames": [
+              "taskId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_history_taskId` ON `${TABLE_NAME}` (`taskId`)"
+          },
+          {
+            "name": "index_history_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_history_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          },
+          {
+            "name": "index_history_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_history_status` ON `${TABLE_NAME}` (`status`)"
+          },
+          {
+            "name": "index_history_saveState_createdAt",
+            "unique": false,
+            "columnNames": [
+              "saveState",
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_history_saveState_createdAt` ON `${TABLE_NAME}` (`saveState`, `createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "tasks",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `uri` TEXT NOT NULL, `displayName` TEXT NOT NULL, `sizeBytes` INTEGER NOT NULL, `status` TEXT NOT NULL, `progress` INTEGER NOT NULL, `outputUri` TEXT, `error` TEXT, `historyId` INTEGER, `createdAt` INTEGER NOT NULL, `batchId` TEXT NOT NULL, `probe_errorCode` INTEGER, `probe_error` TEXT, `probe_hasGainMap` INTEGER, `probe_container` INTEGER, `probe_width` INTEGER, `probe_height` INTEGER, `probe_gainmapWidth` INTEGER, `probe_gainmapHeight` INTEGER, `probe_hasExif` INTEGER, `probe_maxContentBoost` REAL, `probe_hdrCapacityMax` REAL, `result_errorCode` INTEGER, `result_error` TEXT, `result_inputHadGainMap` INTEGER, `result_width` INTEGER, `result_height` INTEGER, `result_gainmapWidth` INTEGER, `result_gainmapHeight` INTEGER, `result_inputBytes` INTEGER, `result_outputBytes` INTEGER, `result_durationMs` REAL, `result_hasGainMap` INTEGER, `result_hasExif` INTEGER, `result_maxContentBoost` REAL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uri",
+            "columnName": "uri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sizeBytes",
+            "columnName": "sizeBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "progress",
+            "columnName": "progress",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputUri",
+            "columnName": "outputUri",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "error",
+            "columnName": "error",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "historyId",
+            "columnName": "historyId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "batchId",
+            "columnName": "batchId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "probe.errorCode",
+            "columnName": "probe_errorCode",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.error",
+            "columnName": "probe_error",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "probe.hasGainMap",
+            "columnName": "probe_hasGainMap",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.container",
+            "columnName": "probe_container",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.width",
+            "columnName": "probe_width",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.height",
+            "columnName": "probe_height",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.gainmapWidth",
+            "columnName": "probe_gainmapWidth",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.gainmapHeight",
+            "columnName": "probe_gainmapHeight",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.hasExif",
+            "columnName": "probe_hasExif",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "probe.maxContentBoost",
+            "columnName": "probe_maxContentBoost",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "probe.hdrCapacityMax",
+            "columnName": "probe_hdrCapacityMax",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "result.errorCode",
+            "columnName": "result_errorCode",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.error",
+            "columnName": "result_error",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "result.inputHadGainMap",
+            "columnName": "result_inputHadGainMap",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.width",
+            "columnName": "result_width",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.height",
+            "columnName": "result_height",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.gainmapWidth",
+            "columnName": "result_gainmapWidth",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.gainmapHeight",
+            "columnName": "result_gainmapHeight",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.inputBytes",
+            "columnName": "result_inputBytes",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.outputBytes",
+            "columnName": "result_outputBytes",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.durationMs",
+            "columnName": "result_durationMs",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "result.hasGainMap",
+            "columnName": "result_hasGainMap",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.hasExif",
+            "columnName": "result_hasExif",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "result.maxContentBoost",
+            "columnName": "result_maxContentBoost",
+            "affinity": "REAL"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "batches",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `itemIds` TEXT NOT NULL, `settings` TEXT NOT NULL, `cancelled` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "itemIds",
+            "columnName": "itemIds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "settings",
+            "columnName": "settings",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cancelled",
+            "columnName": "cancelled",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "replacements",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`historyId` INTEGER NOT NULL, `batchId` TEXT NOT NULL, `sourceUri` TEXT NOT NULL, `outputUri` TEXT NOT NULL, `sourceHash` TEXT NOT NULL, `outputHash` TEXT NOT NULL, `state` TEXT NOT NULL, `note` TEXT NOT NULL, PRIMARY KEY(`historyId`))",
+        "fields": [
+          {
+            "fieldPath": "historyId",
+            "columnName": "historyId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "batchId",
+            "columnName": "batchId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceUri",
+            "columnName": "sourceUri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputUri",
+            "columnName": "outputUri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceHash",
+            "columnName": "sourceHash",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputHash",
+            "columnName": "outputHash",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "historyId"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '241ea7c538180a0c57a31504dfcbc0fc')"
+    ]
+  }
+}

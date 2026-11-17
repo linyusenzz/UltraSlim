@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "UltraSlim"
 include(":app")
+include(":benchmark")

@@ -1707,15 +1707,37 @@ uhdr_error_info_t uhdr_dec_probe(uhdr_codec_private_t* dec) {
             handle->m_img_wd = heif_image_handle_get_width(base_handle);
             handle->m_img_ht = heif_image_handle_get_height(base_handle);
 
+            const auto supportedDimensions = [](const heif_image_handle* image) {
+              const int width = heif_image_handle_get_width(image);
+              const int height = heif_image_handle_get_height(image);
+              return width > 0 && height > 0 && width <= ultrahdr::kMaxWidth &&
+                     height <= ultrahdr::kMaxHeight;
+            };
+            if (!supportedDimensions(base_handle)) {
+              status.error_code = UHDR_CODEC_ERROR;
+              status.has_detail = 1;
+              snprintf(status.detail, sizeof status.detail,
+                       "unsupported primary image dimensions %dx%d", handle->m_img_wd,
+                       handle->m_img_ht);
+            }
+
             struct heif_image_handle* gainmap_handle = nullptr;
-            err = heif_image_handle_get_gain_map_image_handle(base_handle, &gainmap_handle);
+            if (status.error_code == UHDR_CODEC_OK) {
+              err = heif_image_handle_get_gain_map_image_handle(base_handle, &gainmap_handle);
+            }
             if (err.code == heif_error_Ok && gainmap_handle != nullptr) {
               handle->m_gainmap_wd = heif_image_handle_get_width(gainmap_handle);
               handle->m_gainmap_ht = heif_image_handle_get_height(gainmap_handle);
               handle->m_gainmap_num_comp = 1;
 
               int meta_len = heif_image_handle_get_gain_map_metadata_size(base_handle);
-              if (meta_len > 0) {
+              if (!supportedDimensions(gainmap_handle)) {
+                status.error_code = UHDR_CODEC_ERROR;
+                status.has_detail = 1;
+                snprintf(status.detail, sizeof status.detail,
+                         "unsupported gain map image dimensions %dx%d", handle->m_gainmap_wd,
+                         handle->m_gainmap_ht);
+              } else if (meta_len > 0) {
                 std::vector<uint8_t> meta(meta_len);
                 ultrahdr::uhdr_gainmap_metadata_frac frac;
                 ultrahdr::uhdr_gainmap_metadata_ext_t metadata;
