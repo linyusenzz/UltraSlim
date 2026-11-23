@@ -58,18 +58,33 @@ object MediaStoreTrashHelper {
      * 批量请求可达成千条，逐条 round-trip 会长时间卡在 provider 上。
      * 查询失败/被拒时整卷按 UNAVAILABLE 处理——绝不把查询失败当作可以删除的依据。
      */
-    fun originalStates(context: Context, uris: Collection<Uri>): Map<Uri, OriginalState> {
-        if (!isTrashSupported) return uris.associateWith { OriginalState.UNAVAILABLE }
+    fun originalStates(context: Context, uris: Collection<Uri>): Map<Uri, OriginalState> =
+        resolveStatesAndTargets(context, uris).first
+
+    /** Resolves both PRESENT state and canonical MediaStore URI in one pass, avoiding 2x getMediaUri IPCs. */
+    fun activeOriginals(context: Context, uris: Collection<Uri>): Map<Uri, Uri> {
+        val (states, targets) = resolveStatesAndTargets(context, uris)
+        val out = HashMap<Uri, Uri>(targets.size)
+        uris.forEach { uri ->
+            if (states[uri] == OriginalState.PRESENT) targets[uri]?.let { out[uri] = it }
+        }
+        return out
+    }
+
+    private fun resolveStatesAndTargets(context: Context, uris: Collection<Uri>): Pair<Map<Uri, OriginalState>, Map<Uri, Uri>> {
+        if (!isTrashSupported) return uris.associateWith { OriginalState.UNAVAILABLE } to emptyMap()
         val result = HashMap<Uri, OriginalState>(uris.size)
+        val targets = HashMap<Uri, Uri>(uris.size)
         // 按集合（卷）分组，组内合并成一次查询：
         // content://media/<volume>/images/media/<id> → 集合 content://media/<volume>/images/media
         val byCollection = HashMap<Uri, MutableMap<Long, MutableList<Uri>>>()
         uris.forEach { uri ->
             val target = resolveToMediaStoreImageUri(context, uri)
+            if (target != null) targets[uri] = target
             val segments = target?.pathSegments
             val id = segments?.lastOrNull()?.toLongOrNull()
             if (target == null || segments == null || id == null || segments.size < 2) {
-                result[uri] = if (target == null) OriginalState.UNAVAILABLE else originalState(context, uri)
+                result[uri] = if (target == null) OriginalState.UNAVAILABLE else originalState(context, target)
                 return@forEach
             }
             val collection = Uri.Builder().scheme(target.scheme).authority(target.authority)
@@ -113,7 +128,7 @@ object MediaStoreTrashHelper {
                 ids.getValue(id).forEach { result[it] = state }
             }
         }
-        return result
+        return result to targets
     }
 
     fun activeOriginal(context: Context, uri: Uri): Uri? = resolveToMediaStoreImageUri(context, uri)
@@ -121,10 +136,8 @@ object MediaStoreTrashHelper {
 
     fun prepareTrashRequest(context: Context, uris: Collection<Uri>): Request {
         if (!isTrashSupported) return Request(message = "移入回收站需要 Android 11 或更新版本")
-        val states = originalStates(context, uris)
-        val resolved = uris.mapNotNull { uri ->
-            if (states[uri] == OriginalState.PRESENT) resolveToMediaStoreImageUri(context, uri) else null
-        }.distinct().take(MAX_REQUEST_ITEMS)
+        val active = activeOriginals(context, uris)
+        val resolved = uris.mapNotNull { active[it] }.distinct().take(MAX_REQUEST_ITEMS)
         if (resolved.isEmpty()) return Request(message = "原图已删除、已在回收站或当前没有访问权限；可通过相册导入重新授权")
         return try {
             Request(MediaStore.createTrashRequest(context.contentResolver, resolved, true).intentSender, resolved)

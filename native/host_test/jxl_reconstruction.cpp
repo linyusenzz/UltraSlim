@@ -346,6 +346,90 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::cout << "PASS: JXL lossless JPEG reconstruction (SDR/HDR/EXIF/GPS), single-rotation JXL, Motion Photo tail early-stop, and orientPixels parity\n";
+  // 6. ITU-T T.81 0xFF fill bytes before APP1 EXIF/XMP must never bypass location scrubbing
+  {
+    const auto exif6Gps = makeOrientedGpsExif(6);
+    const std::string xmpHdr = "http://ns.adobe.com/xap/1.0/";
+    const std::string xmpGps = "exif:GPSLatitude=35,41.1N";
+    std::vector<uint8_t> xmpPayload(xmpHdr.begin(), xmpHdr.end());
+    xmpPayload.push_back(0);
+    xmpPayload.insert(xmpPayload.end(), xmpGps.begin(), xmpGps.end());
+    const std::vector<uint8_t> comment = {0xFF, 0xFE, 0, 4, 'x', 0xFF};
+    for (int extraFfs : {0, 1, 2, 3}) {
+      std::vector<uint8_t> stuffed = {0xFF, 0xD8};
+      stuffed.insert(stuffed.end(), static_cast<size_t>(extraFfs), 0xFF);
+      const uint16_t exifLen = static_cast<uint16_t>(exif6Gps.size() + 2);
+      stuffed.insert(stuffed.end(), {0xFF, 0xE1, static_cast<uint8_t>(exifLen >> 8), static_cast<uint8_t>(exifLen & 0xFF)});
+      stuffed.insert(stuffed.end(), exif6Gps.begin(), exif6Gps.end());
+      stuffed.insert(stuffed.end(), comment.begin(), comment.end());
+      stuffed.insert(stuffed.end(), static_cast<size_t>(extraFfs), 0xFF);
+      const uint16_t xmpLen = static_cast<uint16_t>(xmpPayload.size() + 2);
+      stuffed.insert(stuffed.end(), {0xFF, 0xE1, static_cast<uint8_t>(xmpLen >> 8), static_cast<uint8_t>(xmpLen & 0xFF)});
+      stuffed.insert(stuffed.end(), xmpPayload.begin(), xmpPayload.end());
+      stuffed.insert(stuffed.end(), sdrOrig.begin() + 2, sdrOrig.end());
+
+      std::vector<uint8_t> scrubbed;
+      int w = 0, h = 0, ori = 0;
+      bool hasExif = false;
+      std::string err;
+      check(ultraslim::prepareJpegForJxlReconstruction(stuffed, /*keepExif=*/true, /*keepLocation=*/false,
+                                                       w, h, ori, hasExif, scrubbed, err),
+            "fill-prefixed JPEG prepares for JXL reconstruction");
+      check(std::search(scrubbed.begin(), scrubbed.end(), comment.begin(), comment.end()) != scrubbed.end(),
+            "stripping XMP preserves preceding COM payload ending in 0xFF");
+      check(w == 240 && h == 320 && ori == 6 && hasExif, "fill-prefixed EXIF orientation detected");
+      check(std::search(scrubbed.begin(), scrubbed.end(), xmpGps.begin(), xmpGps.end()) == scrubbed.end(),
+            "fill-prefixed XMP GPS scrubbed");
+      ultraslim::SdrImage decSdr;
+      check(ultraslim::decodeJpegSdr(scrubbed, decSdr, err) &&
+                !ultraslim::ExifEditor(decSdr.exif).hasGps() &&
+                ultraslim::ExifEditor(decSdr.exif).orientation() == 6,
+            "fill-prefixed EXIF GPS scrubbed while preserving Orientation=6");
+    }
+  }
+
+  // 7. JXL HDR -> HEIC Display P3 derived gamut, 1-channel JXL gain-map gray path, and streaming preview
+  {
+    const std::string hdrJxlPath = outDir + "/recon-hdr.jxl";
+    const std::string jxlToHeic = outDir + "/recon-hdr-to-heic.heic";
+    int inFd = open(hdrJxlPath.c_str(), O_RDONLY | O_BINARY);
+    int outFd = open(jxlToHeic.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_BINARY, 0600);
+    ultraslim::TranscodeOptions opt;
+    opt.outCodec = 1;
+    opt.speedLevel = 2;
+    auto res = ultraslim::transcodeImage(inFd, outFd, opt);
+    close(inFd);
+    close(outFd);
+    check(res.errorCode == 0 && res.hasGainMap, "JXL HDR -> HEIC preservation succeeds");
+
+    const auto heicBytes = loadFile(jxlToHeic);
+    heif_context* ctx = heif_context_alloc();
+    check(heif_context_read_from_memory_without_copy(ctx, heicBytes.data(), heicBytes.size(), nullptr).code == heif_error_Ok,
+          "read JXL->HEIC output");
+    heif_image_handle* primary = nullptr;
+    check(heif_context_get_primary_image_handle(ctx, &primary).code == heif_error_Ok && primary != nullptr,
+          "get JXL->HEIC primary handle");
+    heif_color_profile_nclx* derived = nullptr;
+    check(heif_image_handle_get_derived_image_nclx_color_profile(primary, &derived).code == heif_error_Ok && derived != nullptr,
+          "read JXL->HEIC derived NCLX");
+    check(derived->color_primaries == heif_color_primaries_SMPTE_EG_432_1,
+          "Display P3 JXL HDR retains Display P3 primaries on derived HDR rendition");
+    heif_nclx_color_profile_free(derived);
+    heif_image_handle_release(primary);
+    heif_context_free(ctx);
+
+    int previewFd = open(hdrJxlPath.c_str(), O_RDONLY | O_BINARY);
+    const auto streamedPreview = ultraslim::decodePreviewRgba(previewFd, 96);
+    ultraslim::PreviewGainmapData gmPreview;
+    const bool gmOk = ultraslim::decodePreviewGainmap(previewFd, 256, 128u * 1024 * 1024, gmPreview);
+    close(previewFd);
+    check(std::max(streamedPreview.width, streamedPreview.height) == 96 && !streamedPreview.rgba.empty(),
+          "streaming JXL preview downsamples to requested maxDim");
+    check(gmOk && gmPreview.width > 0 && gmPreview.height > 0 && !gmPreview.pixels.empty() &&
+              gmPreview.maxContentBoost[0] > 1.0f,
+          "decodePreviewGainmap extracts JXL gain map and linear boost metadata");
+  }
+
+  std::cout << "PASS: JXL lossless JPEG reconstruction (SDR/HDR/EXIF/GPS/fill-bytes), P3 derived gamut, streaming preview, and orientPixels parity\n";
   return 0;
 }

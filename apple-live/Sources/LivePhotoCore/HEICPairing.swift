@@ -138,7 +138,7 @@ enum HEICPairing {
         entries.removeAll{$0.id==exifID}; entries.append(replacement)
         var infoData=Data([0,0,0,0])+bytes(UInt64(infos.count+(newItem ? 1:0)),2)
         for b in infos { infoData += original[b.start..<b.end] }
-        if newItem { infoData += box("infe",Data([2,0,0,0])+bytes(exifID,2)+Data([0,0])+Data("Exif\0Exif\0".utf8)) }
+        if newItem { infoData += box("infe",Data([2,0,0,0])+bytes(exifID,2)+Data([0,0])+Data("Exif\0".utf8)) }
         var refData=Data([0,0,0,0]); var hasReference=false
         if let refs=children.first(where:{$0.type=="iref"}) {
             guard refs.payload+4<=refs.end, original[refs.payload]<=1 else { throw LiveError("不支持此 HEIC 引用版本") }

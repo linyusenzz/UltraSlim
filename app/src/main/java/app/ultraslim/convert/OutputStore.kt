@@ -5,8 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import androidx.room.withTransaction
-import kotlinx.coroutines.flow.first
 import app.ultraslim.UltraSlimApp
+import app.ultraslim.data.ConversionDefaults
 import app.ultraslim.data.HistoryEntity
 import app.ultraslim.data.decodeDefaults
 import app.ultraslim.model.OutputFormat
@@ -25,33 +25,51 @@ object OutputStore {
         record: HistoryEntity,
         expectedFingerprint: MediaStoreSaver.Fingerprint? = null,
         finalizePublication: Boolean = true,
+    ): HistoryEntity = saveInternal(
+        app = app,
+        record = record,
+        expectedFingerprint = expectedFingerprint,
+        finalizePublication = finalizePublication,
+    )
+
+    internal suspend fun saveInternal(
+        app: UltraSlimApp,
+        record: HistoryEntity,
+        expectedFingerprint: MediaStoreSaver.Fingerprint? = null,
+        finalizePublication: Boolean = true,
+        knownOptions: ConversionDefaults? = null,
+        knownDates: SourceTimestamps? = null,
+        directoryCache: SelectedOutput.DirectoryCache? = null,
     ): HistoryEntity {
         val saved = saveLock.withLock {
             val current = app.database.historyDao().byId(record.id) ?: error("记录已删除")
             if (current.outputUri.startsWith("content://")) return@withLock current
             val checkpoint = ExportCheckpoint(File(current.outputUri))
-            val replacement = app.database.replacementDao().byId(current.id)?.takeIf { it.state == "PREPARED" }
+            val replacement = if (knownOptions?.autoReplaceOriginals == false) null
+                else app.database.replacementDao().byId(current.id)?.takeIf { it.state == "PREPARED" }
             val source = Uri.parse(replacement?.sourceUri ?: current.inputUri)
-            val metadata = withContext(Dispatchers.IO) { SourceMedia.read(app, source) }
+            val metadata = if (replacement != null) withContext(Dispatchers.IO) { SourceMedia.read(app, source) } else null
             // 私有成品只读一次：调用方（如自动替换 stage）已算过指纹时直接复用；
             // 发布后的相册副本在 MediaStoreSaver.save 内部已完成整读 SHA-256 校验。
             val expected = expectedFingerprint ?: withContext(Dispatchers.IO) {
                 MediaStoreSaver.fingerprintOf(File(current.outputUri))
             }
             val uri = try { withContext(Dispatchers.IO) {
-                val options = app.database.taskDao().batch(current.batchId)?.let { decodeDefaults(it.settings) }
+                val options = knownOptions ?: app.database.taskDao().batchSettings(current.batchId)?.let(::decodeDefaults)
                 val file = File(current.outputUri)
                 val format = OutputFormat.parse(current.format)
                 val task = current.taskId ?: "history-${current.id}"
-                val timestamps = checkpoint.dates() ?: SourceMedia.timestamps(app, source).also(checkpoint::capture)
+                val timestamps = checkpoint.dates() ?: (knownDates ?: SourceMedia.timestamps(app, source)).also(checkpoint::capture)
                 val context = coroutineContext
                 val tree = options?.outputTree?.takeIf { it.isNotBlank() && !options.autoReplaceOriginals }
                 if (tree != null) return@withContext SelectedOutput.save(app, file, current.displayName, format,
-                    Uri.parse(tree), expected ?: error("无法读取成品"), timestamps, { context.ensureActive() })
+                    Uri.parse(tree), expected ?: error("无法读取成品"), timestamps, { context.ensureActive() },
+                    directoryCache = directoryCache)
                 val retainName = options?.retainSourceName == true
                 val sameAlbum = if (replacement != null && metadata != null && retainName) runCatching {
                     SelectedOutput.save(app, file, current.displayName, format, null,
-                        expected ?: error("无法读取成品"), timestamps, { context.ensureActive() }, metadata.volume, metadata.relativePath)
+                        expected ?: error("无法读取成品"), timestamps, { context.ensureActive() },
+                        metadata.volume, metadata.relativePath, directoryCache = directoryCache)
                 }.getOrElse { if (it is kotlinx.coroutines.CancellationException) throw it else null }
                 else if (replacement != null && metadata != null) MediaStoreSaver.save(app, file,
                     current.displayName, format, taskId = task, relativePath = metadata.relativePath,
@@ -62,7 +80,8 @@ object OutputStore {
                     if (replacement != null) AutoReplacement.finish(app, listOf(replacement), "SKIPPED",
                         "无法保存回原相册，成品保存到 UltraSlim，原图保留")
                     if (retainName) SelectedOutput.save(app, file, current.displayName, format, null,
-                        expected ?: error("无法读取成品"), timestamps, { context.ensureActive() })
+                        expected ?: error("无法读取成品"), timestamps, { context.ensureActive() },
+                        directoryCache = directoryCache)
                     else MediaStoreSaver.save(app, file, current.displayName, format, taskId = task, dateTaken = timestamps.dateTaken,
                         fileModifiedTime = timestamps.modifiedAt ?: timestamps.dateTaken,
                         expectedFingerprint = expected)
@@ -77,7 +96,7 @@ object OutputStore {
             // finish() may have added a replacement outcome while saving.
             // MediaStoreSaver.save only returns a non-null URI after matches(resolver, uri, expected) succeeds.
             val verified = uri?.takeIf { expected != null && expected.bytes > 0 }
-            val latest = app.database.historyDao().byId(current.id) ?: current
+            val latest = if (replacement != null) app.database.historyDao().byId(current.id) ?: current else current
             val actualName = verified?.let { withContext(Dispatchers.IO) { runCatching { SelectedOutput.displayName(app, it) }.getOrNull() } }
             val updated = if (verified != null) latest.copy(outputUri = verified.toString(),
                 displayName = actualName ?: latest.displayName, saveState = "SAVED") else latest.copy(saveState = "FAILED")
@@ -89,7 +108,9 @@ object OutputStore {
         }
         if (finalizePublication) withContext(kotlinx.coroutines.NonCancellable) {
             // 相册与 history 已完成，收尾不能被页面生命周期打断。
-            if (saved.saveState == "SAVED") AutoReplacement.saved(app, saved, outputVerified = true)
+            if (saved.saveState == "SAVED" && knownOptions?.autoReplaceOriginals != false) {
+                AutoReplacement.saved(app, saved, outputVerified = true)
+            }
             saved.taskId?.let { id ->
                 app.conversionRepository.update(id) {
                     it.copy(outputUri = saved.outputUri, error = when (saved.saveState) {
@@ -116,7 +137,7 @@ object OutputStore {
         if (!app.conversionMutex.tryLock()) throw ConversionInProgress()
         try {
             // 包含已经排队、尚未取得 conversionMutex 的服务或旧 Worker。
-            if (app.conversionRunning.first()) throw ConversionInProgress()
+            if (app.isConversionRunning()) throw ConversionInProgress()
             saveLock.withLock {
                 app.conversionRepository.awaitReady()
                 val rows = ids.chunked(500).flatMap { app.database.historyDao().byIds(it) }
@@ -136,6 +157,35 @@ object OutputStore {
                     }
                     app.conversionRepository.removeIds(rows.mapNotNull { it.taskId })
                     app.conversionRepository.flush()
+                    val candidateInputs = rows.map { it.inputUri }.filter { it.isNotBlank() }.distinct()
+                    if (candidateInputs.isNotEmpty()) InputStore.referenceLock.withLock {
+                        val stillInHistory = candidateInputs.chunked(500)
+                            .flatMap { app.database.historyDao().referencedInputUris(it) }
+                            .toHashSet()
+                        val stillInQueue = app.conversionRepository.queue.value.mapTo(HashSet()) { it.uri }
+                        val unreferenced = candidateInputs.filterTo(HashSet()) {
+                            it !in stillInHistory && it !in stillInQueue
+                        }
+                        if (unreferenced.isNotEmpty()) {
+                            withContext(Dispatchers.IO) {
+                                val authority = "${app.packageName}.files"
+                                unreferenced.forEach { raw ->
+                                    val parsed = Uri.parse(raw)
+                                    val id = parsed.lastPathSegment
+                                    if (parsed.authority == authority && id != null &&
+                                        !id.contains('/') && !id.contains('\\') && id !in setOf(".", "..")
+                                    ) {
+                                        val inputFile = File(app.filesDir, "inputs/$id")
+                                        if (runCatching { FileProvider.getUriForFile(app, authority, inputFile) == parsed }.getOrDefault(false)) {
+                                            inputFile.delete()
+                                            InputMetadataStore.delete(app, id)
+                                        }
+                                    }
+                                }
+                                InputStore.releaseGrants(app, unreferenced)
+                            }
+                        }
+                    }
                 }
             }
         } finally {

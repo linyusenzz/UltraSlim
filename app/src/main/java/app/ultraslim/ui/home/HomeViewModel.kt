@@ -38,6 +38,8 @@ import org.json.JSONArray
 import app.ultraslim.convert.MediaStoreTrashHelper
 import app.ultraslim.model.OutputFormat
 import app.ultraslim.ui.components.CompressionPreset
+import app.ultraslim.util.TimeGroup
+import app.ultraslim.util.groupByTimeSession
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -75,6 +77,15 @@ sealed interface HomeEvent {
     data class Info(val message: String) : HomeEvent
 }
 
+data class FinishedGroupSummary(
+    val group: TimeGroup<QueueItem>,
+    val savedBytes: Long,
+    val doneCount: Int,
+    val failedCount: Int,
+    val skippedCount: Int,
+    val statusSummary: String,
+)
+
 data class HomeUiState(
     val queue: List<QueueItem> = emptyList(),
     val defaults: ConversionDefaults = ConversionDefaults(),
@@ -86,35 +97,14 @@ data class HomeUiState(
     val batchTotal: Int = 0,
     val batchProcessed: Int = 0,
     val thermalState: ConversionThermalState? = null,
-    val convertibleCount: Int = queue.count {
-        it.status == QueueStatus.PENDING ||
-            it.status == QueueStatus.PROBING ||
-            it.status == QueueStatus.READY
-    },
-    val hasFinishedItems: Boolean = queue.any { it.status == QueueStatus.DONE },
-    val convertingItem: QueueItem? = queue.firstOrNull { it.status == QueueStatus.CONVERTING },
-    val pendingItems: List<QueueItem> = queue.filter {
-        it.status == QueueStatus.PENDING ||
-            it.status == QueueStatus.PROBING ||
-            it.status == QueueStatus.READY
-    },
-    val finishedItems: List<QueueItem> = queue.filter {
-        it.status == QueueStatus.DONE ||
-            it.status == QueueStatus.SKIPPED ||
-            it.status == QueueStatus.FAILED
-    },
-    val pendingGroups: List<app.ultraslim.util.TimeGroup<QueueItem>> =
-        app.ultraslim.util.groupByTimeSession(
-            items = pendingItems,
-            timestampSelector = { it.createdAt },
-            batchIdSelector = { it.batchId },
-        ),
-    val finishedGroups: List<app.ultraslim.util.TimeGroup<QueueItem>> =
-        app.ultraslim.util.groupByTimeSession(
-            items = finishedItems,
-            timestampSelector = { it.createdAt },
-            batchIdSelector = { it.batchId },
-        ),
+    val convertibleCount: Int = 0,
+    val hasFinishedItems: Boolean = false,
+    val convertingItem: QueueItem? = null,
+    val pendingItems: List<QueueItem> = emptyList(),
+    val finishedItems: List<QueueItem> = emptyList(),
+    val pendingGroups: List<TimeGroup<QueueItem>> = emptyList(),
+    val finishedGroups: List<TimeGroup<QueueItem>> = emptyList(),
+    val finishedSummaries: List<FinishedGroupSummary> = emptyList(),
 )
 
 class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
@@ -154,16 +144,30 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
 
     private val probePermits = Semaphore(SCAN_PARALLELISM)
 
-    /** 可移入系统回收站的原图 URI（已完成且产出更小的条目）；Default 线程预解析。 */
-    private val _trashableOriginalUris = MutableStateFlow<List<Uri>>(emptyList())
-    val trashableOriginalUris: StateFlow<List<Uri>> = _trashableOriginalUris.asStateFlow()
+    /** 可移入系统回收站的原图 URI（已完成且产出更小的条目）；按需订阅并在 IO 线程单遍预解析。 */
     private val trashResolutionLock = kotlinx.coroutines.sync.Mutex()
     private val resolvedOriginals = mutableMapOf<String, Uri>()
+    private val trashRefreshTrigger = MutableStateFlow(0L)
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    val trashableOriginalUris: StateFlow<List<Uri>> = combine(
+        repo.queue
+            .sample(TRASH_RESOLVE_SAMPLE_MILLIS)
+            .map { list ->
+                list.filter {
+                    it.status == QueueStatus.DONE && it.result != null &&
+                        it.result.outputBytes < it.result.inputBytes
+                }.map { it.uri }.distinct()
+            }
+            .distinctUntilChanged(),
+        trashRefreshTrigger,
+    ) { sources, _ ->
+        resolveTrashable(sources, refresh = false)
+    }.flowOn(Dispatchers.IO).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val workRunning: Flow<Boolean> = app.conversionRunning.distinctUntilChanged()
 
-    // 批次中每张图至少 3 次 repo.update；sample 把 UI 侧的全列表重算（过滤/分组/求和）
-    // 收敛到每个时间窗口一次，避免 500 张批次触发上千次 O(n log n) 分组。
+    // 批次中每张图至少 3 次 repo.update；sample 把 UI 侧的全列表重算（单遍分类/分组/求和）
+    // 收敛到每个时间窗口一次，避免 500 张批次触发上千次多遍扫描与分组。
     // 统计由 Repository 在查询前合并 invalidation，并与成品库共享。
     @OptIn(kotlinx.coroutines.FlowPreview::class)
     val uiState: StateFlow<HomeUiState> = combine(
@@ -174,22 +178,97 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
         activeBatchIds,
     ) { queue, defaults, stats, workState, batchIds ->
         val (running, thermal) = workState
-        val byId = queue.associateBy { it.id }
-        val ids = batchIds.ifEmpty { queue.map { it.id } }
-        val processed = ids.count { id -> byId[id]?.status.let {
-            it == null || it == QueueStatus.DONE || it == QueueStatus.SKIPPED || it == QueueStatus.FAILED
-        } }
+        val byId = HashMap<String, QueueItem>(queue.size * 2)
+        val pendingItems = ArrayList<QueueItem>(queue.size)
+        val finishedItems = ArrayList<QueueItem>(queue.size)
+        var convertingItem: QueueItem? = null
+        var totalQueueBytes = 0L
+        var hasFailed = false
+        var hasFinishedItems = false
+        var hasThermalReady = false
+        for (item in queue) {
+            byId[item.id] = item
+            totalQueueBytes += item.sizeBytes
+            when (item.status) {
+                QueueStatus.PENDING, QueueStatus.PROBING, QueueStatus.READY -> {
+                    pendingItems += item
+                    if (item.status == QueueStatus.READY && item.error?.startsWith("系统报告") == true) {
+                        hasThermalReady = true
+                    }
+                }
+                QueueStatus.CONVERTING -> if (convertingItem == null) convertingItem = item
+                QueueStatus.DONE -> {
+                    hasFinishedItems = true
+                    finishedItems += item
+                }
+                QueueStatus.SKIPPED -> finishedItems += item
+                QueueStatus.FAILED -> {
+                    hasFailed = true
+                    finishedItems += item
+                }
+            }
+        }
+        val processed = if (batchIds.isEmpty()) {
+            finishedItems.size
+        } else {
+            batchIds.count { id ->
+                byId[id]?.status.let {
+                    it == null || it == QueueStatus.DONE || it == QueueStatus.SKIPPED || it == QueueStatus.FAILED
+                }
+            }
+        }
+        val pendingGroups = groupByTimeSession(
+            items = pendingItems,
+            timestampSelector = { it.createdAt },
+            batchIdSelector = { it.batchId },
+        )
+        val finishedGroups = groupByTimeSession(
+            items = finishedItems,
+            timestampSelector = { it.createdAt },
+            batchIdSelector = { it.batchId },
+        )
+        val finishedSummaries = finishedGroups.map { group ->
+            var groupSaved = 0L
+            var doneCount = 0
+            var failedCount = 0
+            var skippedCount = 0
+            for (item in group.items) {
+                groupSaved += (item.result?.inputBytes ?: item.sizeBytes) - (item.result?.outputBytes ?: item.sizeBytes)
+                when (item.status) {
+                    QueueStatus.DONE -> doneCount++
+                    QueueStatus.FAILED -> failedCount++
+                    QueueStatus.SKIPPED -> skippedCount++
+                    else -> {}
+                }
+            }
+            val summaryText = when {
+                failedCount > 0 && doneCount > 0 -> "$doneCount 成功 · $failedCount 失败"
+                failedCount > 0 -> "$failedCount 项失败"
+                skippedCount > 0 && doneCount > 0 -> "$doneCount 成功 · $skippedCount 保留原图"
+                skippedCount > 0 -> "$skippedCount 项保留原图"
+                else -> "全部成功"
+            }
+            FinishedGroupSummary(group, groupSaved, doneCount, failedCount, skippedCount, summaryText)
+        }
         HomeUiState(
             queue = queue,
             defaults = defaults,
             totalSavedBytes = stats.totalSavedBytes,
             convertedCount = stats.countDone,
-            isConverting = running || queue.any { it.status == QueueStatus.CONVERTING },
-            totalQueueBytes = queue.sumOf { it.sizeBytes },
-            hasFailed = queue.any { it.status == QueueStatus.FAILED },
-            batchTotal = ids.size,
+            isConverting = running || convertingItem != null,
+            totalQueueBytes = totalQueueBytes,
+            hasFailed = hasFailed,
+            batchTotal = if (batchIds.isEmpty()) queue.size else batchIds.size,
             batchProcessed = processed,
-            thermalState = thermal.takeIf { queue.any { it.status == QueueStatus.READY && it.error?.startsWith("系统报告") == true } },
+            thermalState = thermal.takeIf { hasThermalReady },
+            convertibleCount = pendingItems.size,
+            hasFinishedItems = hasFinishedItems,
+            convertingItem = convertingItem,
+            pendingItems = pendingItems,
+            finishedItems = finishedItems,
+            pendingGroups = pendingGroups,
+            finishedGroups = finishedGroups,
+            finishedSummaries = finishedSummaries,
         )
     }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUiState())
 
@@ -205,10 +284,10 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             }
             if (unfinished && snapshot?.isValid == false) {
                 val affected = snapshot.itemIds.toMutableSet().apply {
-                    repo.queue.value.filter { it.batchId == latest?.id }.mapTo(this) { it.id }
+                    repo.queue.value.filter { it.batchId == latest.id }.mapTo(this) { it.id }
                 }
                 repo.updateAll(affected) {
-                    if (it.batchId != latest?.id || it.status in listOf(QueueStatus.DONE, QueueStatus.SKIPPED)) it
+                    if (it.batchId != latest.id || it.status in listOf(QueueStatus.DONE, QueueStatus.SKIPPED)) it
                     else it.copy(status = QueueStatus.FAILED, error = BATCH_SNAPSHOT_ERROR)
                 }
                 repo.flush()
@@ -222,16 +301,6 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
                     outputTree = saved.outputTree, outputTreeLabel = saved.outputTreeLabel,
                     retainSourceName = saved.retainSourceName)
             }
-        }
-        // 批次中只补新增原图；实际发起回收前仍由 refreshAndGetTrashable 全量校验。
-        viewModelScope.launch(Dispatchers.IO) {
-            repo.queue
-                .sample(TRASH_RESOLVE_SAMPLE_MILLIS)
-                .map { list -> list.filter { it.status == QueueStatus.DONE && it.result != null && it.result.outputBytes < it.result.inputBytes }.map { it.uri }.distinct() }
-                .distinctUntilChanged()
-                .collectLatest { sources ->
-                    resolveTrashable(sources, refresh = false)
-                }
         }
         viewModelScope.launch {
             repo.incoming.collect { uris ->
@@ -391,8 +460,9 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
         importImages(uris.asFlow().map { ImportImage(it) }, ignoreLivePhotos, uris.size)
 
     /** Persist small batches and probe at most four files at a time, even with thousands of inputs. */
-    private suspend fun importImages(images: Flow<ImportImage>, ignoreLivePhotos: Boolean, total: Int? = null): ImportResult {
+    private suspend fun importImages(images: Flow<ImportImage>, ignoreLivePhotos: Boolean, total: Int? = null): ImportResult = InputStore.referenceLock.withLock {
         repo.awaitReady()
+        withContext(Dispatchers.IO) { InputStore.pruneAppGrants(app, nearLimitOnly = true) }
         val seen = repo.queue.value.mapTo(mutableSetOf()) { it.uri }
         var added = 0
         var duplicates = 0
@@ -446,7 +516,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             _importing.value = false
             _importProgress.value = ""
         }
-        return ImportResult(added, duplicates, ignoredLive, failed)
+        ImportResult(added, duplicates, ignoredLive, failed)
     }
 
     fun cancelConversion() {
@@ -579,11 +649,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     }.flowOn(Dispatchers.IO)
 
     private suspend fun probeHasGainMap(uri: Uri): Boolean = probePermits.withPermit {
-        val probe = withContext(Dispatchers.IO) {
-            runCatching { app.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
-        }?.use { pfd ->
-            ImageWork.run { runCatching { UltraHdrBridge.nativeProbe(pfd.fd) }.getOrNull() }
-        }
+        val probe = probeSource(uri)
         if (probe != null && probe.isSuccess && probe.hasGainMap) scannedProbes[uri.toString()] = probe
         probe != null && probe.isSuccess && probe.hasGainMap
     }
@@ -632,9 +698,9 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
 
     fun retryItem(id: String) {
         if (uiState.value.isConverting) { _events.tryEmit(HomeEvent.Info("请等待当前批次结束后重试")); return }
-        val item = repo.find(id) ?: return
-        repo.update(id) { it.copy(status = QueueStatus.PENDING, error = null, probe = null) }
-        viewModelScope.launch { probeItems(listOf(item)) }
+        if (repo.find(id) == null) return
+        // ConversionRunner 会在编码前对当前 URI 做一次最新 nativeProbe，无需在此并发抢占 ImageWork。
+        repo.update(id) { it.copy(status = QueueStatus.READY, error = null) }
         startConversion(onlyIds = setOf(id))
     }
 
@@ -642,10 +708,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
         if (uiState.value.isConverting) return
         val failed = repo.queue.value.filter { it.status == QueueStatus.FAILED }
         if (failed.isEmpty()) return
-        repo.updateAll(failed.map { it.id }) { it.copy(status = QueueStatus.PENDING, error = null, probe = null) }
-        viewModelScope.launch {
-            failed.chunked(32).forEach { probeItems(it) }
-        }
+        repo.updateAll(failed.map { it.id }) { it.copy(status = QueueStatus.READY, error = null) }
         startConversion(onlyIds = failed.mapTo(mutableSetOf()) { it.id })
     }
 
@@ -731,9 +794,11 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
     }
 
     private suspend fun probeUri(uri: Uri) = probePermits.withPermit {
-        scannedProbes.remove(uri.toString()) ?: withContext(Dispatchers.IO) {
-            runCatching { app.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
-        }?.use { pfd ->
+        scannedProbes.remove(uri.toString()) ?: probeSource(uri)
+    }
+
+    private suspend fun probeSource(uri: Uri) = withContext(Dispatchers.IO) {
+        runCatching { app.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()?.use { pfd ->
             ImageWork.run { runCatching { UltraHdrBridge.nativeProbe(pfd.fd) }.getOrNull() }
         }
     }
@@ -807,16 +872,14 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
             val pending = sources.filter { !resolvedOriginals.containsKey(it) }
             if (pending.isNotEmpty()) {
                 coroutineContext.ensureActive()
-                // 整批一次状态查询，避免逐条 provider round-trip。
+                // 单遍完成状态检查与 MediaStore 标准 URI 解析，免掉二次 getMediaUri 往返。
                 val parsed = pending.map { it to Uri.parse(it) }
-                val states = MediaStoreTrashHelper.originalStates(app, parsed.map { it.second })
+                val active = MediaStoreTrashHelper.activeOriginals(app, parsed.map { it.second })
                 parsed.forEach { (source, uri) ->
-                    if (states[uri] == MediaStoreTrashHelper.OriginalState.PRESENT) {
-                        MediaStoreTrashHelper.resolveToMediaStoreImageUri(app, uri)?.let { resolvedOriginals[source] = it }
-                    }
+                    active[uri]?.let { resolvedOriginals[source] = it }
                 }
             }
-            sources.mapNotNull { resolvedOriginals[it] }.distinct().also { _trashableOriginalUris.value = it }
+            sources.mapNotNull { resolvedOriginals[it] }.distinct()
         }
 
     /** 回收请求及批次结束时重新校验，同时刷新增量缓存。 */
@@ -824,7 +887,7 @@ class HomeViewModel(private val app: UltraSlimApp) : ViewModel() {
         val sources = repo.queue.value
             .filter { it.status == QueueStatus.DONE && it.result != null && it.result.outputBytes < it.result.inputBytes }
             .map { it.uri }.distinct()
-        resolveTrashable(sources, refresh = true)
+        resolveTrashable(sources, refresh = true).also { trashRefreshTrigger.value++ }
     }
 
     suspend fun requestTrashOriginals(): android.content.IntentSender? {

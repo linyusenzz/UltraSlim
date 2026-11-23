@@ -111,6 +111,20 @@ object UltraHdrBridge {
     ): android.graphics.Bitmap?
 
     /**
+     * Decodes the HDR gain map (ALPHA_8 for single-channel, ARGB_8888 for multi-channel)
+     * and writes ISO 21496-1 metadata into an 18-element [outMetadata]:
+     * `[minBoost0..2, maxBoost0..2, gamma0..2, offsetSdr0..2, offsetHdr0..2, capacityMin, capacityMax, alternateCicpPrimaries]`.
+     * Zero primaries means to apply the gain map in the base image's gamut.
+     */
+    @JvmStatic
+    external fun nativeDecodeGainmapBitmap(
+        fd: Int,
+        maxDim: Int,
+        maxWorkingBytes: Long = Long.MAX_VALUE,
+        outMetadata: FloatArray,
+    ): android.graphics.Bitmap?
+
+    /**
      * Decodes the primary SDR rendition of an image to a small JPEG, for previews
      * the platform decoder cannot handle (e.g. ISO 21496-1 gain map HEIC).
      * Returns null on failure or if the estimated pixel working set exceeds the

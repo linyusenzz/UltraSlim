@@ -17,14 +17,30 @@ import java.security.MessageDigest
 
 /** A durable, opt-in journal. Originals are only ever sent to the system's recoverable trash. */
 internal object AutoReplacement {
+    internal data class SliceFingerprint(
+        val fullSha256: String,
+        val bytes: Long,
+        val sliceSha256: String? = null,
+    )
+
+    private val validatedOutputs = java.util.concurrent.ConcurrentHashMap<Long, Pair<String, String>>()
+
+    internal fun recordValidated(historyId: Long, outputHash: String) {
+        if (historyId <= 0L || outputHash.isEmpty()) return
+        if (validatedOutputs.size >= 4096) validatedOutputs.clear()
+        validatedOutputs[historyId] = outputHash to Build.FINGERPRINT
+    }
+
     /**
-     * 一次确认点击内的共享查询。设置、批次取消状态、原图回收站状态在整轮复核中逐行相同，
-     * 而批量规模可达 2000 行，逐行重复 DataStore/provider 往返是这一轮的主要固定开销。
+     * 一次确认点击内的共享查询。设置、批次取消状态、原图回收站状态、历史行与原相册位置在整轮复核中可批量预取，
+     * 批量规模可达 2000 行，避免逐行重复 DataStore/Room/MediaStore 往返。
      */
     internal class Pass(private val app: UltraSlimApp) {
         @Volatile private var enabled: Boolean? = null
         private val batchActiveMap = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
         private val originalStates = java.util.concurrent.ConcurrentHashMap<String, MediaStoreTrashHelper.OriginalState>()
+        private val histories = java.util.concurrent.ConcurrentHashMap<Long, HistoryEntity>()
+        private val locations = java.util.concurrent.ConcurrentHashMap<String, SourceMedia>()
 
         suspend fun autoReplaceEnabled(): Boolean {
             enabled?.let { return it }
@@ -33,10 +49,10 @@ internal object AutoReplacement {
             return value
         }
 
-        /** null 表示批次不存在；与 batch(...)?.cancelled == false 的语义一致。 */
+        /** null 表示批次不存在；与 isBatchCancelled(...) == false 的语义一致。 */
         suspend fun batchActive(batchId: String): Boolean {
             batchActiveMap[batchId]?.let { return it }
-            val active = app.database.taskDao().batch(batchId)?.cancelled == false
+            val active = app.database.taskDao().isBatchCancelled(batchId) == false
             batchActiveMap[batchId] = active
             return active
         }
@@ -56,20 +72,91 @@ internal object AutoReplacement {
             originalStates[key] = state
             return state
         }
+
+        suspend fun prefetchHistories(ids: Collection<Long>) {
+            val missing = ids.filter { !histories.containsKey(it) }.distinct()
+            if (missing.isEmpty()) return
+            app.database.historyDao().byIds(missing).forEach { histories[it.id] = it }
+        }
+
+        suspend fun history(id: Long): HistoryEntity? {
+            histories[id]?.let { return it }
+            return app.database.historyDao().byId(id)?.also { histories[id] = it }
+        }
+
+        fun prefetchLocations(uris: Collection<Uri>) {
+            val missing = uris.filter { !locations.containsKey(it.toString()) }.distinct()
+            if (missing.isEmpty()) return
+            SourceMedia.readBatch(app, missing, includeExifFallback = false).forEach { (u, m) ->
+                locations[u.toString()] = m
+            }
+        }
+
+        fun location(uri: Uri): SourceMedia? {
+            val key = uri.toString()
+            locations[key]?.let { return it }
+            return SourceMedia.read(app, uri)?.also { locations[key] = it }
+        }
+    }
+
+    internal fun fingerprintStream(input: java.io.InputStream, motion: MotionPhotoInfo? = null): SliceFingerprint {
+        val fullDigest = MessageDigest.getInstance("SHA-256")
+        val sliceDigest = if (motion != null && motion.videoLength > 0) MessageDigest.getInstance("SHA-256") else null
+        val sliceStart = motion?.videoOffset ?: -1L
+        val sliceEnd = if (sliceDigest != null) sliceStart + motion!!.videoLength else -1L
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        var sliceBytes = 0L
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) break
+            if (n > 0) {
+                fullDigest.update(buffer, 0, n)
+                if (sliceDigest != null) {
+                    val from = maxOf(total, sliceStart)
+                    val to = minOf(total + n, sliceEnd)
+                    if (from < to) {
+                        val len = (to - from).toInt()
+                        sliceDigest.update(buffer, (from - total).toInt(), len)
+                        sliceBytes += len
+                    }
+                }
+                total += n
+            }
+        }
+        check(total > 0) { "文件为空" }
+        if (sliceDigest != null) check(sliceBytes == motion!!.videoLength) { "实况视频不完整" }
+        return SliceFingerprint(
+            fullSha256 = MediaStoreSaver.hex(fullDigest.digest()),
+            bytes = total,
+            sliceSha256 = sliceDigest?.let { MediaStoreSaver.hex(it.digest()) },
+        )
+    }
+
+    internal fun fingerprintFile(file: File, motion: MotionPhotoInfo? = null): SliceFingerprint =
+        file.inputStream().use { fingerprintStream(it, motion) }
+
+    internal fun fingerprintChannel(channel: java.nio.channels.FileChannel): String {
+        channel.position(0)
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = java.nio.ByteBuffer.allocate(64 * 1024)
+        var total = 0L
+        while (true) {
+            buffer.clear()
+            val n = channel.read(buffer)
+            if (n < 0) break
+            if (n > 0) {
+                digest.update(buffer.array(), 0, n)
+                total += n
+            }
+        }
+        check(total > 0) { "文件为空" }
+        return MediaStoreSaver.hex(digest.digest())
     }
 
     fun fingerprint(app: UltraSlimApp, uri: Uri): String =
         app.contentResolver.openInputStream(uri)?.use { input ->
-            val digest = MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(64 * 1024)
-            var total = 0L
-            while (true) {
-                val n = input.read(buffer)
-                if (n < 0) break
-                if (n > 0) { digest.update(buffer, 0, n); total += n }
-            }
-            check(total > 0) { "文件为空" }
-            digest.digest().joinToString("") { "%02x".format(it) }
+            fingerprintStream(input).fullSha256
         } ?: error("无法读取文件")
 
     private fun requireReadable(app: UltraSlimApp, uri: Uri, history: HistoryEntity) {
@@ -91,22 +178,6 @@ internal object AutoReplacement {
         } finally { bitmap.recycle() }
     }
 
-    private fun videoHash(app: UltraSlimApp, uri: Uri, info: MotionPhotoInfo): String {
-        val fd = app.contentResolver.openFileDescriptor(uri, "r") ?: error("无法读取实况视频")
-        return ParcelFileDescriptor.AutoCloseInputStream(fd).use { input ->
-            input.channel.position(info.videoOffset)
-            val digest = MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(64 * 1024)
-            var remaining = info.videoLength
-            while (remaining > 0) {
-                val n = input.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
-                check(n > 0) { "实况视频不完整" }
-                digest.update(buffer, 0, n); remaining -= n
-            }
-            digest.digest().joinToString("") { "%02x".format(it) }
-        }
-    }
-
     /** Called before saving deletes the private output. Failure only prevents replacing the original. */
     suspend fun stage(
         app: UltraSlimApp,
@@ -116,6 +187,8 @@ internal object AutoReplacement {
         knownMotion: MotionPhotoInfo? = null,
         hasKnownMotion: Boolean = false,
         platformValidated: Boolean = false,
+        knownOutputMotion: MotionPhotoInfo? = null,
+        knownOutputVideoHash: String? = null,
     ) = withContext(Dispatchers.IO) {
         try {
             check(app.settingsRepository.defaults.first().autoReplaceOriginals) { "自动替换已关闭" }
@@ -125,19 +198,31 @@ internal object AutoReplacement {
             val target = MediaStoreTrashHelper.resolveToMediaStoreImageUri(app, source) ?: error("无法安全定位相册原图，请在历史中手动处理")
             check(MediaStoreTrashHelper.originalState(app, target) == MediaStoreTrashHelper.OriginalState.PRESENT) { "原图已删除、在回收站或不可访问" }
             check(SourceMedia.read(app, target) != null) { "无法确定原相册位置" }
-            // source 与 target 常解析到同一相册项，避免对同一文件做两次全量哈希。
-            val sourceHash = fingerprint(app, source)
+            val motion = if (hasKnownMotion) knownMotion else MotionPhotoHelper.detect(app, source)
+            // 单遍读取同时计算原图全文 SHA-256 与实况视频段 SHA-256；source 与 target 同一 URI 时免二次整读。
+            val sourceSlice = app.contentResolver.openInputStream(source)?.use { fingerprintStream(it, motion) }
+                ?: error("无法读取文件")
+            val sourceHash = sourceSlice.fullSha256
             val targetHash = if (target == source) sourceHash else fingerprint(app, target)
             check(sourceHash == originalHash && targetHash == originalHash) { "原图已发生变化" }
-            val output = Uri.fromFile(File(history.outputUri))
+            val outputFile = File(history.outputUri)
+            val output = Uri.fromFile(outputFile)
             if (!platformValidated) requireReadable(app, output, history)
-            val motion = if (hasKnownMotion) knownMotion else MotionPhotoHelper.detect(app, source)
+            val outHash: String
             if (motion != null) {
-                val savedMotion = MotionPhotoHelper.detect(app, output) ?: error("成品未保留实况视频")
+                val savedMotion = knownOutputMotion ?: MotionPhotoHelper.detect(app, output) ?: error("成品未保留实况视频")
+                val outSlice = if (outputFingerprint != null && outputFingerprint.bytes > 0 && knownOutputVideoHash != null) {
+                    SliceFingerprint(outputFingerprint.sha256, outputFingerprint.bytes, knownOutputVideoHash)
+                } else {
+                    fingerprintFile(outputFile, savedMotion)
+                }
                 check(savedMotion == motion.copy(videoOffset = savedMotion.videoOffset) &&
-                    videoHash(app, source, motion) == videoHash(app, output, savedMotion)) { "实况视频校验失败" }
+                    sourceSlice.sliceSha256 != null && sourceSlice.sliceSha256 == outSlice.sliceSha256) { "实况视频校验失败" }
+                outHash = outSlice.fullSha256
+            } else {
+                outHash = outputFingerprint?.takeIf { it.bytes > 0 }?.sha256 ?: fingerprint(app, output)
             }
-            val outHash = outputFingerprint?.takeIf { it.bytes > 0 }?.sha256 ?: fingerprint(app, output)
+            recordValidated(history.id, outHash)
             app.database.replacementDao().insert(ReplacementEntity(history.id, history.batchId, target.toString(), "",
                 originalHash, outHash))
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
@@ -169,9 +254,9 @@ internal object AutoReplacement {
                          pass: Pass? = null, recheckOutput: Boolean = true, recheckReadable: Boolean = true) = withContext(Dispatchers.IO) {
         val enabled = pass?.autoReplaceEnabled() ?: app.settingsRepository.defaults.first().autoReplaceOriginals
         check(enabled) { "自动替换已关闭" }
-        val batchActive = pass?.batchActive(item.batchId) ?: (app.database.taskDao().batch(item.batchId)?.cancelled == false)
+        val batchActive = pass?.batchActive(item.batchId) ?: (app.database.taskDao().isBatchCancelled(item.batchId) == false)
         check(batchActive) { "批次已取消" }
-        val history = app.database.historyDao().byId(item.historyId) ?: error("记录已移除")
+        val history = pass?.history(item.historyId) ?: app.database.historyDao().byId(item.historyId) ?: error("记录已移除")
         check(history.saveState == "SAVED" && history.outputUri == item.outputUri) { "成品尚未保存" }
         check(item.sourceUri != item.outputUri) { "原图与成品位置相同" }
         val sourceUri = Uri.parse(item.sourceUri)
@@ -184,19 +269,28 @@ internal object AutoReplacement {
             check(fingerprint(app, Uri.parse(item.outputUri)) == item.outputHash) { "成品已变化或不可访问" }
         }
         if (recheckReadable) {
-            requireReadable(app, Uri.parse(item.outputUri), history)
+            val alreadyVerified = recheckOutput &&
+                validatedOutputs[item.historyId] == (item.outputHash to Build.FINGERPRINT)
+            if (!alreadyVerified) {
+                requireReadable(app, Uri.parse(item.outputUri), history)
+                if (recheckOutput) recordValidated(item.historyId, item.outputHash)
+            }
         }
-        restoreOriginalAlbum(app, item)
+        restoreOriginalAlbum(app, item, pass)
     }
 
     /** Also repairs READY journals from versions which always published into UltraSlim. */
-    private fun restoreOriginalAlbum(app: UltraSlimApp, item: ReplacementEntity) {
-        val source = SourceMedia.read(app, Uri.parse(item.sourceUri)) ?: error("无法确定原相册位置")
+    private fun restoreOriginalAlbum(app: UltraSlimApp, item: ReplacementEntity, pass: Pass? = null) {
+        val sourceUri = Uri.parse(item.sourceUri)
+        var source = pass?.location(sourceUri) ?: SourceMedia.read(app, sourceUri) ?: error("无法确定原相册位置")
         val outputUri = Uri.parse(item.outputUri)
-        val output = SourceMedia.read(app, outputUri) ?: error("无法确定成品位置")
+        val output = pass?.location(outputUri) ?: SourceMedia.read(app, outputUri) ?: error("无法确定成品位置")
         check(source.volume == output.volume) { "成品不在原存储卷，原图保留" }
         if (source.relativePath != output.relativePath) {
             check(app.galleryPublishingAllowed.value) { "回到应用后才能将成品移回原相册" }
+            if (source.dateTaken == null && pass != null) {
+                source = SourceMedia.read(app, sourceUri) ?: source
+            }
             MediaStoreSaver.preserveFileTime(app, outputUri, source.modifiedAt ?: source.dateTaken)
             val values = android.content.ContentValues().apply {
                 put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, source.relativePath)

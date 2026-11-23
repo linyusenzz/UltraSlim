@@ -84,7 +84,15 @@ fun AdaptiveWorkspace(
     val folds = currentWorkspaceFolds()
     var origin by remember { mutableStateOf(Offset.Zero) }
     val density = LocalDensity.current
-    BoxWithConstraints(modifier.fillMaxSize().onGloballyPositioned { origin = it.positionInWindow() }) {
+    val positionedModifier = if (folds.isNotEmpty()) {
+        modifier.fillMaxSize().onGloballyPositioned {
+            val pos = it.positionInWindow()
+            if (pos != origin) origin = pos
+        }
+    } else {
+        modifier.fillMaxSize()
+    }
+    BoxWithConstraints(positionedModifier) {
         val plan = workspacePlan(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat(), density.density,
             folds.map { it.copy(bounds = it.bounds.translate(-origin)) }, minPaneWidth.value, expandedWidth.value)
         Layout(

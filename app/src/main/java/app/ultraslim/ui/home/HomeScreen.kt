@@ -586,23 +586,14 @@ fun HomeScreen(onOpenSettings: () -> Unit, onOpenDetail: (Long) -> Unit, replace
                                 }
                             }
                         }
-                        finishedGroups.forEach { group ->
-                            val groupSaved = group.items.sumOf { (it.result?.inputBytes ?: it.sizeBytes) - (it.result?.outputBytes ?: it.sizeBytes) }
-                            val failedCount = group.items.count { it.status == QueueStatus.FAILED }
-                            val skippedCount = group.items.count { it.status == QueueStatus.SKIPPED }
-                            val doneCount = group.items.count { it.status == QueueStatus.DONE }
+                        state.finishedSummaries.forEach { summary ->
+                            val group = summary.group
                             item(key = "group-finished-${group.key}", contentType = "group-header") {
                                 BatchGroupHeader(
                                     title = group.title,
                                     count = group.items.size,
-                                    savedBytes = groupSaved,
-                                    statusSummary = when {
-                                        failedCount > 0 && doneCount > 0 -> "$doneCount 成功 · $failedCount 失败"
-                                        failedCount > 0 -> "$failedCount 项失败"
-                                        skippedCount > 0 && doneCount > 0 -> "$doneCount 成功 · $skippedCount 保留原图"
-                                        skippedCount > 0 -> "$skippedCount 项保留原图"
-                                        else -> "全部成功"
-                                    },
+                                    savedBytes = summary.savedBytes,
+                                    statusSummary = summary.statusSummary,
                                     action = {
                                         IconButton(
                                             onClick = {

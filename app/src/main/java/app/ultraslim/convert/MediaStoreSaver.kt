@@ -124,7 +124,7 @@ object MediaStoreSaver {
                     }
                 }
             } ?: throw IOException("openOutputStream returned null for $uri")
-            check(written == expected.bytes && digest.digest().joinToString("") { "%02x".format(it) } == expected.sha256) {
+            check(written == expected.bytes && hex(digest.digest()) == expected.sha256) {
                 "相册副本写入校验失败"
             }
             // Capture time and file modification time are different. Preserve both when known;
@@ -152,6 +152,18 @@ object MediaStoreSaver {
     internal fun fingerprintOf(file: File): Fingerprint? =
         runCatching { file.inputStream().use(::fingerprint) }.getOrNull()
 
+    private val HEX_CHARS = "0123456789abcdef".toCharArray()
+
+    internal fun hex(bytes: ByteArray): String {
+        val out = CharArray(bytes.size * 2)
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xff
+            out[i * 2] = HEX_CHARS[v ushr 4]
+            out[i * 2 + 1] = HEX_CHARS[v and 0x0f]
+        }
+        return String(out)
+    }
+
     private fun fingerprint(input: InputStream): Fingerprint {
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(64 * 1024)
@@ -161,7 +173,7 @@ object MediaStoreSaver {
             if (count < 0) break
             if (count > 0) { digest.update(buffer, 0, count); bytes += count }
         }
-        return Fingerprint(bytes, digest.digest().joinToString("") { "%02x".format(it) })
+        return Fingerprint(bytes, hex(digest.digest()))
     }
 
     private fun matches(resolver: ContentResolver, uri: Uri, expected: Fingerprint): Boolean = runCatching {

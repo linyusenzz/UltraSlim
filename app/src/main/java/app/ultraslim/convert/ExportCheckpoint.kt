@@ -7,10 +7,16 @@ import java.io.File
 
 /** Durable source dates and ownership of a publication, independent of the source grant. */
 internal class ExportCheckpoint(private val output: File) {
-    private val storage = AtomicFile(File(output.path + ".export.json"))
-    private fun read(): JSONObject = runCatching {
-        JSONObject(storage.openRead().bufferedReader().use { it.readText() })
-    }.getOrElse { JSONObject() }
+    private val file = File(output.path + ".export.json")
+    private val storage = AtomicFile(file)
+    private fun read(): JSONObject {
+        if (!file.exists() && !File(output.path + ".export.json.new").exists() &&
+            !File(output.path + ".export.json.bak").exists()
+        ) return JSONObject()
+        return runCatching {
+            JSONObject(storage.openRead().bufferedReader().use { it.readText() })
+        }.getOrElse { JSONObject() }
+    }
 
     private fun write(json: JSONObject) {
         val stream = storage.startWrite()

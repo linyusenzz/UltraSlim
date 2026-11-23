@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <csetjmp>
 #include <cerrno>
 #include <chrono>
@@ -43,6 +44,8 @@
 #include <jxl/decode.h>
 #include <jxl/color_encoding.h>
 #include <jxl/cms.h>
+#include <jxl/compressed_icc.h>
+#include <jxl/gain_map.h>
 #include <jxl/thread_parallel_runner.h>
 
 #include "ultrahdr/gainmapmetadata.h"
@@ -52,6 +55,10 @@
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+
+#ifndef ULTRASLIM_ENABLE_REBUILD
+#define ULTRASLIM_ENABLE_REBUILD 1
 #endif
 
 // strong definitions; libultrahdr's patched HEIF/AVIF encoders read these via a weak default
@@ -194,6 +201,8 @@ uint32_t loadBE32(const uint8_t* p) {
 
 struct JhgmLayout {
   BytesView iso;
+  BytesView colorEncoding;
+  BytesView altIcc;
   BytesView codestream;
 };
 
@@ -208,11 +217,13 @@ bool parseJhgmLayout(BytesView box, JhgmLayout& out) {
   if (cursor == box.size()) return false;
   const size_t colorEncodingSize = box.data()[cursor++];
   if (colorEncodingSize > box.size() - cursor) return false;
+  out.colorEncoding = BytesView(box.data() + cursor, colorEncodingSize);
   cursor += colorEncodingSize;
   if (box.size() - cursor < 4) return false;
   const size_t altIccSize = loadBE32(box.data() + cursor);
   cursor += 4;
   if (altIccSize > box.size() - cursor) return false;
+  out.altIcc = BytesView(box.data() + cursor, altIccSize);
   cursor += altIccSize;
   if (cursor == box.size()) return false;
   out.codestream = BytesView(box.data() + cursor, box.size() - cursor);
@@ -345,6 +356,19 @@ bool previewFits(int w, int h, int maxDim, uint64_t budget, uint64_t inputBytes 
   const int64_t nw = edge > maxDim ? std::max<int64_t>(1, int64_t(w) * maxDim / edge) : w;
   const int64_t nh = edge > maxDim ? std::max<int64_t>(1, int64_t(h) * maxDim / edge) : h;
   const uint64_t estimated = uint64_t(w) * h * 20 + uint64_t(nw) * nh * 16 +
+                             inputBytes + 16u * 1024 * 1024;
+  return estimated <= budget;
+}
+
+// Streaming JXL previews downsample scanlines in JxlDecoderSetImageOutCallback
+// without allocating a full-resolution RGBA buffer.
+bool jxlPreviewFits(int w, int h, int maxDim, uint64_t budget, uint64_t inputBytes = 0) {
+  if (w <= 0 || h <= 0 || int64_t(w) * h > kMaxPixels) return false;
+  const int edge = std::max(w, h);
+  if (maxDim <= 0 || edge <= maxDim) return previewFits(w, h, maxDim > 0 ? maxDim : edge, budget, inputBytes);
+  const int64_t nw = std::max<int64_t>(1, int64_t(w) * maxDim / edge);
+  const int64_t nh = std::max<int64_t>(1, int64_t(h) * maxDim / edge);
+  const uint64_t estimated = uint64_t(w) * h * 8 + uint64_t(nw) * nh * 36 +
                              inputBytes + 16u * 1024 * 1024;
   return estimated <= budget;
 }
@@ -1165,9 +1189,46 @@ bool probeJxl(BytesView data, ProbeResult& r) {
   return true;
 }
 
+struct JxlStreamPreviewAccumulator {
+  int sw = 0;
+  int sh = 0;
+  int nw = 0;
+  int nh = 0;
+  std::unique_ptr<std::atomic<uint32_t>[]> bins;
+
+  static void callback(void* opaque, size_t x, size_t y, size_t num_pixels, const void* pixels) {
+    auto* self = static_cast<JxlStreamPreviewAccumulator*>(opaque);
+    if (!self || !pixels || num_pixels == 0 || y >= static_cast<size_t>(self->sh)) return;
+    const int dy = static_cast<int>((static_cast<uint64_t>(y) * self->nh) / self->sh);
+    if (dy < 0 || dy >= self->nh) return;
+    const auto* src = static_cast<const uint8_t*>(pixels);
+    const size_t maxPixels = std::min<size_t>(num_pixels, static_cast<size_t>(self->sw) - std::min<size_t>(x, self->sw));
+    size_t i = 0;
+    while (i < maxPixels) {
+      const size_t sx = x + i;
+      const int dx = static_cast<int>((static_cast<uint64_t>(sx) * self->nw) / self->sw);
+      uint32_t r = 0, g = 0, b = 0, a = 0, c = 0;
+      while (i < maxPixels &&
+             static_cast<int>((static_cast<uint64_t>(x + i) * self->nw) / self->sw) == dx) {
+        const uint8_t* p = src + i * 4;
+        r += p[0]; g += p[1]; b += p[2]; a += p[3];
+        ++c;
+        ++i;
+      }
+      auto* dst = self->bins.get() + (static_cast<size_t>(dy) * self->nw + dx) * 5;
+      dst[0].fetch_add(r, std::memory_order_relaxed);
+      dst[1].fetch_add(g, std::memory_order_relaxed);
+      dst[2].fetch_add(b, std::memory_order_relaxed);
+      dst[3].fetch_add(a, std::memory_order_relaxed);
+      dst[4].fetch_add(c, std::memory_order_relaxed);
+    }
+  }
+};
+
 bool decodeJxlToSdr(const std::vector<uint8_t>& data, SdrImage& out,
                     std::vector<uint8_t>* outJhgm, std::string& err,
-                    int previewLimit = 0, uint64_t budget = UINT64_MAX) {
+                    int previewLimit = 0, uint64_t budget = UINT64_MAX,
+                    bool grayscaleOnly = false) {
   TraceStage trace("decode.jxl");
   JxlDecoder* dec = JxlDecoderCreate(nullptr);
   if (!dec) { err = "无法创建 JXL 解码器"; return false; }
@@ -1186,6 +1247,8 @@ bool decodeJxlToSdr(const std::vector<uint8_t>& data, SdrImage& out,
   JxlDecoderCloseInput(dec);
 
   bool success = false;
+  bool streamingPreview = false;
+  JxlStreamPreviewAccumulator previewAccum;
   JxlBasicInfo info {};
   std::vector<uint8_t> currBoxData;
   JxlBoxType currBoxType = {0};
@@ -1206,15 +1269,39 @@ bool decodeJxlToSdr(const std::vector<uint8_t>& data, SdrImage& out,
         break;
       }
       if (info.xsize > INT32_MAX || info.ysize > INT32_MAX ||
-          !previewFits(info.xsize, info.ysize, previewLimit > 0 ? previewLimit : std::max(info.xsize, info.ysize), budget, data.size())) {
+          !jxlPreviewFits(static_cast<int>(info.xsize), static_cast<int>(info.ysize),
+                          previewLimit > 0 ? previewLimit : static_cast<int>(std::max(info.xsize, info.ysize)),
+                          budget, data.size())) {
         err = "图片尺寸或预览内存超出限制";
         break;
       }
       out.colorChannels = info.num_color_channels;
       out.hasAlpha = info.alpha_bits != 0;
-      out.width = info.xsize;
-      out.height = info.ysize;
+      out.width = static_cast<int>(info.xsize);
+      out.height = static_cast<int>(info.ysize);
     } else if (status == JXL_DEC_COLOR_ENCODING) {
+      JxlColorEncoding encoded {};
+      if (JxlDecoderGetColorAsEncodedProfile(dec, JXL_COLOR_PROFILE_TARGET_DATA, &encoded) == JXL_DEC_SUCCESS &&
+          encoded.color_space == JXL_COLOR_SPACE_RGB && encoded.white_point == JXL_WHITE_POINT_D65) {
+        if (encoded.primaries == JXL_PRIMARIES_P3 || encoded.primaries == JXL_PRIMARIES_2100 ||
+            encoded.primaries == JXL_PRIMARIES_SRGB) {
+          out.profile = heif_color_profile_nclx {};
+          out.profile.version = 1;
+          out.profile.color_primaries = encoded.primaries == JXL_PRIMARIES_P3
+              ? heif_color_primaries_SMPTE_EG_432_1
+              : encoded.primaries == JXL_PRIMARIES_2100
+                    ? heif_color_primaries_ITU_R_BT_2020_2_and_2100_0
+                    : heif_color_primaries_ITU_R_BT_709_5;
+          out.profile.transfer_characteristics = encoded.transfer_function == JXL_TRANSFER_FUNCTION_SRGB
+              ? heif_transfer_characteristic_IEC_61966_2_1
+              : encoded.transfer_function == JXL_TRANSFER_FUNCTION_LINEAR
+                    ? heif_transfer_characteristic_linear
+                    : heif_transfer_characteristic_unspecified;
+          out.profile.matrix_coefficients = heif_matrix_coefficients_ITU_R_BT_709_5;
+          out.profile.full_range_flag = 1;
+          out.hasProfile = out.profile.transfer_characteristics != heif_transfer_characteristic_unspecified;
+        }
+      }
       size_t icc_size = 0;
       if (JxlDecoderGetICCProfileSize(dec, JXL_COLOR_PROFILE_TARGET_DATA, &icc_size) == JXL_DEC_SUCCESS &&
           icc_size > 0 && icc_size < 16 * 1024 * 1024) {
@@ -1224,16 +1311,45 @@ bool decodeJxlToSdr(const std::vector<uint8_t>& data, SdrImage& out,
         }
       }
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
-      size_t buf_size = 0;
-      JxlPixelFormat pf = {4, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0};
-      if (JxlDecoderImageOutBufferSize(dec, &pf, &buf_size) != JXL_DEC_SUCCESS) {
-        err = "获取 JXL 输出大小失败";
-        break;
-      }
-      out.rgba.resize(buf_size);
-      if (JxlDecoderSetImageOutBuffer(dec, &pf, out.rgba.data(), out.rgba.size()) != JXL_DEC_SUCCESS) {
-        err = "设置 JXL 输出缓冲失败";
-        break;
+      const int edge = std::max(out.width, out.height);
+      if (!grayscaleOnly && previewLimit > 0 && edge > previewLimit) {
+        streamingPreview = true;
+        previewAccum.sw = out.width;
+        previewAccum.sh = out.height;
+        previewAccum.nw = static_cast<int>(std::max<int64_t>(1, int64_t(out.width) * previewLimit / edge));
+        previewAccum.nh = static_cast<int>(std::max<int64_t>(1, int64_t(out.height) * previewLimit / edge));
+        previewAccum.bins.reset(
+            new std::atomic<uint32_t>[static_cast<size_t>(previewAccum.nw) * previewAccum.nh * 5]());
+        JxlPixelFormat pf = {4, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0};
+        if (JxlDecoderSetImageOutCallback(dec, &pf, &JxlStreamPreviewAccumulator::callback, &previewAccum) !=
+            JXL_DEC_SUCCESS) {
+          err = "设置 JXL 流式预览回调失败";
+          break;
+        }
+      } else if (grayscaleOnly && info.num_color_channels == 1 && info.alpha_bits == 0) {
+        size_t buf_size = 0;
+        JxlPixelFormat pf = {1, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0};
+        if (JxlDecoderImageOutBufferSize(dec, &pf, &buf_size) != JXL_DEC_SUCCESS) {
+          err = "获取 JXL 单通道输出大小失败";
+          break;
+        }
+        out.gray.resize(buf_size);
+        if (JxlDecoderSetImageOutBuffer(dec, &pf, out.gray.data(), out.gray.size()) != JXL_DEC_SUCCESS) {
+          err = "设置 JXL 单通道输出缓冲失败";
+          break;
+        }
+      } else {
+        size_t buf_size = 0;
+        JxlPixelFormat pf = {4, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0};
+        if (JxlDecoderImageOutBufferSize(dec, &pf, &buf_size) != JXL_DEC_SUCCESS) {
+          err = "获取 JXL 输出大小失败";
+          break;
+        }
+        out.rgba.resize(buf_size);
+        if (JxlDecoderSetImageOutBuffer(dec, &pf, out.rgba.data(), out.rgba.size()) != JXL_DEC_SUCCESS) {
+          err = "设置 JXL 输出缓冲失败";
+          break;
+        }
       }
     } else if (status == JXL_DEC_BOX) {
       if (JxlDecoderGetBoxType(dec, currBoxType, JXL_TRUE) == JXL_DEC_SUCCESS) {
@@ -1279,7 +1395,26 @@ bool decodeJxlToSdr(const std::vector<uint8_t>& data, SdrImage& out,
 
   JxlDecoderDestroy(dec);
   if (runner) JxlThreadParallelRunnerDestroy(runner);
-  return success && !out.rgba.empty();
+  if (success && streamingPreview && previewAccum.bins) {
+    const size_t total = static_cast<size_t>(previewAccum.nw) * previewAccum.nh;
+    out.rgba.resize(total * 4);
+    for (size_t idx = 0; idx < total; ++idx) {
+      const auto* b = previewAccum.bins.get() + idx * 5;
+      const uint32_t count = b[4].load(std::memory_order_relaxed);
+      if (count == 0) {
+        out.rgba.clear();
+        return false;
+      }
+      const uint32_t half = count / 2;
+      out.rgba[idx * 4 + 0] = static_cast<uint8_t>((b[0].load(std::memory_order_relaxed) + half) / count);
+      out.rgba[idx * 4 + 1] = static_cast<uint8_t>((b[1].load(std::memory_order_relaxed) + half) / count);
+      out.rgba[idx * 4 + 2] = static_cast<uint8_t>((b[2].load(std::memory_order_relaxed) + half) / count);
+      out.rgba[idx * 4 + 3] = static_cast<uint8_t>((b[3].load(std::memory_order_relaxed) + half) / count);
+    }
+    out.width = previewAccum.nw;
+    out.height = previewAccum.nh;
+  }
+  return success && (!out.rgba.empty() || !out.gray.empty());
 }
 
 heif_error fdWriteCallback(heif_context* /*ctx*/, const void* data, size_t size, void* userdata) {
@@ -1304,7 +1439,10 @@ void scaledSize(int sw, int sh, int percent, int& w, int& h) {
   h = evenAtLeast2(static_cast<int>(static_cast<int64_t>(sh) * scale / 100));
 }
 
-// Fixed-point bilinear. Sample positions are computed once per axis.
+// Fixed-point separable bilinear. Sample positions are computed once per axis;
+// each worker caches the two active horizontally-interpolated source rows so
+// adjacent output rows sharing y0/y1 skip horizontal recomputation while keeping
+// exact 30-bit fixed-point rounding parity with the direct formula.
 std::vector<uint8_t> resizeRgbaPlane(const uint8_t* s, int sw, int sh, size_t stride,
                                      int newW, int newH) {
   TraceStage trace("prepare.resize");
@@ -1313,7 +1451,11 @@ std::vector<uint8_t> resizeRgbaPlane(const uint8_t* s, int sw, int sh, size_t st
   std::vector<uint8_t> out(static_cast<size_t>(newW) * newH * 4);
   if (sw == newW && sh == newH) {
     const size_t rowBytes = size_t(sw) * 4;
-    for (int y = 0; y < sh; ++y) memcpy(out.data() + size_t(y) * rowBytes, s + size_t(y) * stride, rowBytes);
+    parallelRows(sh, size_t(sw) * sh, [&](int begin, int end) {
+      for (int y = begin; y < end; ++y) {
+        memcpy(out.data() + size_t(y) * rowBytes, s + size_t(y) * stride, rowBytes);
+      }
+    });
     return out;
   }
 
@@ -1339,8 +1481,31 @@ std::vector<uint8_t> resizeRgbaPlane(const uint8_t* s, int sw, int sh, size_t st
     wxs[static_cast<size_t>(x)] = wx;
   }
 
+  auto interpHorizontal = [&](const uint8_t* srcRow, uint32_t* hRow) {
+    for (int x = 0; x < newW; ++x) {
+      const uint8_t* p0 = srcRow + static_cast<size_t>(x0s[static_cast<size_t>(x)]) * 4;
+      const uint8_t* p1 = srcRow + static_cast<size_t>(x1s[static_cast<size_t>(x)]) * 4;
+      const uint32_t uwx = static_cast<uint32_t>(wxs[static_cast<size_t>(x)]);
+      const uint32_t uwx0 = 32768u - uwx;
+#if defined(__ARM_NEON)
+      uint32_t raw0, raw1;
+      memcpy(&raw0, p0, 4);
+      memcpy(&raw1, p1, 4);
+      const uint32x4_t c0 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw0)))));
+      const uint32x4_t c1 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw1)))));
+      vst1q_u32(hRow + static_cast<size_t>(x) * 4, vmlaq_n_u32(vmulq_n_u32(c0, uwx0), c1, uwx));
+#else
+      uint32_t* hd = hRow + static_cast<size_t>(x) * 4;
+      for (int c = 0; c < 4; ++c) hd[c] = p0[c] * uwx0 + p1[c] * uwx;
+#endif
+    }
+  };
+
   uint8_t* d = out.data();
   parallelRows(newH, size_t(newW) * newH, [&](int begin, int end) {
+    std::vector<uint32_t> bufA(static_cast<size_t>(newW) * 4);
+    std::vector<uint32_t> bufB(static_cast<size_t>(newW) * 4);
+    int cachedA = -1, cachedB = -1;
     for (int y = begin; y < end; y++) {
       const int64_t fy = (static_cast<int64_t>(y) * 2 + 1) * sh * 32768 / (2 * newH) - 16384;
       int y0 = 0, y1 = 0, wy = 0;
@@ -1354,45 +1519,48 @@ std::vector<uint8_t> resizeRgbaPlane(const uint8_t* s, int sw, int sh, size_t st
           y1 = y0 + 1;
         }
       }
+      if (y0 != cachedA && y0 == cachedB) {
+        std::swap(bufA, bufB);
+        std::swap(cachedA, cachedB);
+      }
+      if (y0 != cachedA) {
+        interpHorizontal(s + static_cast<size_t>(y0) * stride, bufA.data());
+        cachedA = y0;
+      }
+      const uint32_t* h0Ptr = bufA.data();
+      const uint32_t* h1Ptr = bufA.data();
+      if (y1 != y0) {
+        if (y1 != cachedB) {
+          interpHorizontal(s + static_cast<size_t>(y1) * stride, bufB.data());
+          cachedB = y1;
+        }
+        h1Ptr = bufB.data();
+      }
       const uint32_t uwy = static_cast<uint32_t>(wy);
       const uint32_t uwy0 = 32768u - uwy;
-      const uint8_t* row0 = s + static_cast<size_t>(y0) * stride;
-      const uint8_t* row1 = s + static_cast<size_t>(y1) * stride;
       uint8_t* dst = d + static_cast<size_t>(y) * static_cast<size_t>(newW) * 4;
-      for (int x = 0; x < newW; x++) {
-        const int x0 = x0s[static_cast<size_t>(x)];
-        const int x1 = x1s[static_cast<size_t>(x)];
-        const uint32_t uwx = static_cast<uint32_t>(wxs[static_cast<size_t>(x)]);
-        const uint32_t uwx0 = 32768u - uwx;
-        const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 4;
-        const uint8_t* p01 = row0 + static_cast<size_t>(x1) * 4;
-        const uint8_t* p10 = row1 + static_cast<size_t>(x0) * 4;
-        const uint8_t* p11 = row1 + static_cast<size_t>(x1) * 4;
+      const size_t totalCh = static_cast<size_t>(newW) * 4;
+      size_t ch = 0;
 #if defined(__ARM_NEON)
-        uint32_t raw00, raw01, raw10, raw11;
-        memcpy(&raw00, p00, 4); memcpy(&raw01, p01, 4);
-        memcpy(&raw10, p10, 4); memcpy(&raw11, p11, 4);
-        const uint32x4_t c00 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw00)))));
-        const uint32x4_t c01 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw01)))));
-        const uint32x4_t c10 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw10)))));
-        const uint32x4_t c11 = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw11)))));
-        const uint32x4_t h0 = vmlaq_n_u32(vmulq_n_u32(c00, uwx0), c01, uwx);
-        const uint32x4_t h1 = vmlaq_n_u32(vmulq_n_u32(c10, uwx0), c11, uwx);
-        const uint64x2_t bias = vdupq_n_u64(1ull << 29);
-        const uint64x2_t vLo = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_low_u32(h0), uwy0), vget_low_u32(h1), uwy), bias);
-        const uint64x2_t vHi = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_high_u32(h0), uwy0), vget_high_u32(h1), uwy), bias);
-        const uint32x4_t out32 = vcombine_u32(vmovn_u64(vshrq_n_u64(vLo, 30)), vmovn_u64(vshrq_n_u64(vHi, 30)));
-        const uint8x8_t out8 = vmovn_u16(vcombine_u16(vmovn_u32(out32), vdup_n_u16(0)));
-        vst1_lane_u32(reinterpret_cast<uint32_t*>(dst), vreinterpret_u32_u8(out8), 0);
-#else
-        for (int c = 0; c < 4; c++) {
-          const uint32_t h0 = p00[c] * uwx0 + p01[c] * uwx;
-          const uint32_t h1 = p10[c] * uwx0 + p11[c] * uwx;
-          const uint64_t v = static_cast<uint64_t>(h0) * uwy0 + static_cast<uint64_t>(h1) * uwy;
-          dst[c] = static_cast<uint8_t>((v + (1ull << 29)) >> 30);
-        }
+      const uint64x2_t bias = vdupq_n_u64(1ull << 29);
+      for (; ch + 8 <= totalCh; ch += 8) {
+        const uint32x4_t a0 = vld1q_u32(h0Ptr + ch);
+        const uint32x4_t b0 = vld1q_u32(h1Ptr + ch);
+        const uint32x4_t a1 = vld1q_u32(h0Ptr + ch + 4);
+        const uint32x4_t b1 = vld1q_u32(h1Ptr + ch + 4);
+        const uint64x2_t v0Lo = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_low_u32(a0), uwy0), vget_low_u32(b0), uwy), bias);
+        const uint64x2_t v0Hi = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_high_u32(a0), uwy0), vget_high_u32(b0), uwy), bias);
+        const uint64x2_t v1Lo = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_low_u32(a1), uwy0), vget_low_u32(b1), uwy), bias);
+        const uint64x2_t v1Hi = vaddq_u64(vmlal_n_u32(vmull_n_u32(vget_high_u32(a1), uwy0), vget_high_u32(b1), uwy), bias);
+        const uint32x4_t out32_0 = vcombine_u32(vmovn_u64(vshrq_n_u64(v0Lo, 30)), vmovn_u64(vshrq_n_u64(v0Hi, 30)));
+        const uint32x4_t out32_1 = vcombine_u32(vmovn_u64(vshrq_n_u64(v1Lo, 30)), vmovn_u64(vshrq_n_u64(v1Hi, 30)));
+        const uint8x8_t out8 = vmovn_u16(vcombine_u16(vmovn_u32(out32_0), vmovn_u32(out32_1)));
+        vst1_u8(dst + ch, out8);
+      }
 #endif
-        dst += 4;
+      for (; ch < totalCh; ++ch) {
+        const uint64_t v = static_cast<uint64_t>(h0Ptr[ch]) * uwy0 + static_cast<uint64_t>(h1Ptr[ch]) * uwy;
+        dst[ch] = static_cast<uint8_t>((v + (1ull << 29)) >> 30);
       }
     }
   });
@@ -1425,22 +1593,115 @@ bool prepareJpegProfile(SdrImage& img) {
   img.icc.assign(data+ultrahdr::kICCIdentifierSize,data+profile->getLength());return true;
 }
 
+uhdr_color_gamut_t getGamutFromJxlColor(const JxlColorEncoding& color) {
+  if (color.color_space == JXL_COLOR_SPACE_RGB && color.white_point == JXL_WHITE_POINT_D65) {
+    if (color.primaries == JXL_PRIMARIES_P3) return UHDR_CG_DISPLAY_P3;
+    if (color.primaries == JXL_PRIMARIES_2100) return UHDR_CG_BT_2100;
+    if (color.primaries == JXL_PRIMARIES_SRGB) return UHDR_CG_BT_709;
+  }
+  return UHDR_CG_UNSPECIFIED;
+}
+
+heif_color_primaries primariesForGamut(uhdr_color_gamut_t gamut) {
+  switch (gamut) {
+    case UHDR_CG_BT_709: return heif_color_primaries_ITU_R_BT_709_5;
+    case UHDR_CG_DISPLAY_P3: return heif_color_primaries_SMPTE_EG_432_1;
+    case UHDR_CG_BT_2100: return heif_color_primaries_ITU_R_BT_2020_2_and_2100_0;
+    default: return heif_color_primaries_unspecified;
+  }
+}
+
+uhdr_color_gamut_t gamutFromPrimaries(heif_color_primaries primaries) {
+  switch (primaries) {
+    case heif_color_primaries_ITU_R_BT_709_5: return UHDR_CG_BT_709;
+    case heif_color_primaries_SMPTE_EG_432_1: return UHDR_CG_DISPLAY_P3;
+    case heif_color_primaries_ITU_R_BT_2020_2_and_2100_0: return UHDR_CG_BT_2100;
+    default: return UHDR_CG_UNSPECIFIED;
+  }
+}
+
 uhdr_color_gamut_t getGamutFromIcc(const uint8_t* data, size_t size) {
   if (!data || size == 0) return UHDR_CG_UNSPECIFIED;
   constexpr size_t kPrefixSize = ultrahdr::kICCIdentifierSize;
+  const uint8_t* rawIcc = data;
+  size_t rawSize = size;
+  uhdr_color_gamut_t cg = UHDR_CG_UNSPECIFIED;
   if (size > kPrefixSize && memcmp(data, ultrahdr::kICCIdentifier, sizeof(ultrahdr::kICCIdentifier)) == 0) {
-    return ultrahdr::IccHelper::readIccColorGamut(const_cast<uint8_t*>(data), size);
+    cg = ultrahdr::IccHelper::readIccColorGamut(const_cast<uint8_t*>(data), size);
+    rawIcc = data + kPrefixSize;
+    rawSize = size - kPrefixSize;
+  } else {
+    std::vector<uint8_t> withPrefix(kPrefixSize + size);
+    memcpy(withPrefix.data(), ultrahdr::kICCIdentifier, sizeof(ultrahdr::kICCIdentifier));
+    withPrefix[sizeof(ultrahdr::kICCIdentifier)] = 1;
+    withPrefix[sizeof(ultrahdr::kICCIdentifier) + 1] = 1;
+    memcpy(withPrefix.data() + kPrefixSize, data, size);
+    cg = ultrahdr::IccHelper::readIccColorGamut(withPrefix.data(), withPrefix.size());
   }
-  std::vector<uint8_t> withPrefix(kPrefixSize + size);
-  memcpy(withPrefix.data(), ultrahdr::kICCIdentifier, sizeof(ultrahdr::kICCIdentifier));
-  withPrefix[sizeof(ultrahdr::kICCIdentifier)] = 1;
-  withPrefix[sizeof(ultrahdr::kICCIdentifier) + 1] = 1;
-  memcpy(withPrefix.data() + kPrefixSize, data, size);
-  return ultrahdr::IccHelper::readIccColorGamut(withPrefix.data(), withPrefix.size());
+  if (cg != UHDR_CG_UNSPECIFIED) return cg;
+  const JxlCmsInterface* cms = JxlGetDefaultCms();
+  if (cms && cms->set_fields_from_icc && rawSize > 0) {
+    JxlColorEncoding color {};
+    JXL_BOOL cmyk = JXL_FALSE;
+    if (cms->set_fields_from_icc(cms->set_fields_data, rawIcc, rawSize, &color, &cmyk) && !cmyk) {
+      return getGamutFromJxlColor(color);
+    }
+  }
+  return UHDR_CG_UNSPECIFIED;
 }
 
 uhdr_color_gamut_t getGamutFromIcc(const std::vector<uint8_t>& icc) {
   return getGamutFromIcc(icc.data(), icc.size());
+}
+
+const JxlMemoryManager kIccMemoryManager = {
+    nullptr,
+    [](void*, size_t size) -> void* { return size <= kMaxBoxBytes ? std::malloc(size) : nullptr; },
+    [](void*, void* data) { std::free(data); },
+};
+
+std::vector<uint8_t> compressJxlIcc(const uint8_t* data, size_t size) {
+  if (!data || size == 0 || size > kMaxBoxBytes) return {};
+  if (size > ultrahdr::kICCIdentifierSize &&
+      memcmp(data, ultrahdr::kICCIdentifier, sizeof(ultrahdr::kICCIdentifier)) == 0) {
+    data += ultrahdr::kICCIdentifierSize;
+    size -= ultrahdr::kICCIdentifierSize;
+  }
+  uint8_t* encoded = nullptr;
+  size_t encodedSize = 0;
+  const bool ok = JxlICCProfileEncode(&kIccMemoryManager, data, size, &encoded, &encodedSize);
+  std::unique_ptr<uint8_t, decltype(&std::free)> owner(encoded, std::free);
+  if (!ok || !encoded || encodedSize == 0) return {};
+  return {encoded, encoded + encodedSize};
+}
+
+uhdr_color_gamut_t getJhgmAlternateGamut(BytesView box, const JhgmLayout& layout) {
+  if (!layout.altIcc.empty()) {
+    uint8_t* icc = nullptr;
+    size_t size = 0;
+    const bool ok = JxlICCProfileDecode(&kIccMemoryManager, layout.altIcc.data(), layout.altIcc.size(),
+                                        &icc, &size);
+    std::unique_ptr<uint8_t, decltype(&std::free)> owner(icc, std::free);
+    return ok ? getGamutFromIcc(icc, size) : UHDR_CG_UNSPECIFIED;
+  }
+  if (!layout.colorEncoding.empty()) {
+    JxlGainMapBundle bundle {};
+    size_t bytesRead = 0;
+    if (JxlGainMapReadBundle(&bundle, box.data(), box.size(), &bytesRead) && bundle.has_color_encoding) {
+      return getGamutFromJxlColor(bundle.color_encoding);
+    }
+  }
+  return UHDR_CG_UNSPECIFIED;
+}
+
+std::vector<uint8_t> getHeifDerivedIcc(heif_image_handle* handle) {
+  const size_t size = heif_image_handle_get_derived_image_raw_color_profile_size(handle);
+  if (size == 0 || size > kMaxBoxBytes) return {};
+  std::vector<uint8_t> icc(size);
+  if (heif_image_handle_get_derived_image_raw_color_profile(handle, icc.data()).code != heif_error_Ok) {
+    return {};
+  }
+  return icc;
 }
 
 // 实测（26MP 噪声图，q90/95/100）：接管 libjpeg 缓冲省掉的 assign 拷贝仅占编码时间的
@@ -1740,6 +2001,8 @@ struct GainMapPayload {
   bool heicGainmapCompatibility = false;
   SdrImage image;
   std::vector<uint8_t> iso;
+  std::vector<uint8_t> alternateIcc;  // JPEG XL compressed ICC representation.
+  std::vector<uint8_t> alternateColorEncoding;
   int codec = 1;
   bool multiChannel = true;
   // Not owned. Null selects a BT.2100 HLG profile for the derived rendition.
@@ -2183,8 +2446,9 @@ int encodeJxlGainMapBox(GainMapPayload* gainmap, int speedLevel, int th,
   JxlEncoderSetColorEncoding(gm_enc, &gm_color);
 
   JxlEncoderFrameSettings* gm_settings = JxlEncoderFrameSettingsCreate(gm_enc, nullptr);
-  int gm_effort = (speedLevel == 2) ? 3 : ((speedLevel == 0) ? 7 : 5);
+  int gm_effort = (speedLevel == 2) ? 3 : ((speedLevel == 0) ? 5 : 4);
   JxlEncoderFrameSettingsSetOption(gm_settings, JXL_ENC_FRAME_SETTING_EFFORT, gm_effort);
+  JxlEncoderFrameSettingsSetOption(gm_settings, JXL_ENC_FRAME_SETTING_DECODING_SPEED, 2);
 
   const size_t pixelCount = static_cast<size_t>(gainmap->image.width) * gainmap->image.height;
   if (JxlEncoderSetFrameLossless(gm_settings, JXL_TRUE) != JXL_ENC_SUCCESS) {
@@ -2256,15 +2520,26 @@ int encodeJxlGainMapBox(GainMapPayload* gainmap, int speedLevel, int th,
   JxlEncoderDestroy(gm_enc);
   if (gm_runner) JxlThreadParallelRunnerDestroy(gm_runner);
 
-  size_t jhgm_size = 1 + 2 + gainmap->iso.size() + 1 + 4 + gm_codestream.size();
+  const auto& colorEncoding = gainmap->alternateColorEncoding;
+  const auto& icc = gainmap->alternateIcc;
+  const size_t jhgm_size = 1 + 2 + gainmap->iso.size() + 1 + colorEncoding.size() +
+                           4 + icc.size() + gm_codestream.size();
+  if (jhgm_size > kMaxBoxBytes || gainmap->iso.size() > UINT16_MAX || colorEncoding.size() > UINT8_MAX) {
+    err = "JXL 增益图元数据过大";
+    return 24;
+  }
   jhgmLocal.resize(jhgm_size);
   jhgmLocal[0] = 0; // version 0
   storeBE16(static_cast<uint16_t>(gainmap->iso.size()), jhgmLocal.data() + 1);
   memcpy(jhgmLocal.data() + 3, gainmap->iso.data(), gainmap->iso.size());
   size_t cursor = 3 + gainmap->iso.size();
-  jhgmLocal[cursor++] = 0; // no extra color encoding
-  storeBE32(0, jhgmLocal.data() + cursor); // no alt ICC
+  jhgmLocal[cursor++] = static_cast<uint8_t>(colorEncoding.size());
+  std::copy(colorEncoding.begin(), colorEncoding.end(), jhgmLocal.begin() + cursor);
+  cursor += colorEncoding.size();
+  storeBE32(static_cast<uint32_t>(icc.size()), jhgmLocal.data() + cursor);
   cursor += 4;
+  std::copy(icc.begin(), icc.end(), jhgmLocal.begin() + cursor);
+  cursor += icc.size();
   memcpy(jhgmLocal.data() + cursor, gm_codestream.data(), gm_codestream.size());
   if (gainmap->cacheForRetry) {
     gainmap->encodedJxl = std::move(jhgmLocal);
@@ -2359,6 +2634,7 @@ int encodeJxl(const SdrImage& base, int quality, bool keepExif, int outFd,
   JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, nullptr);
   int effort = (speedLevel == 2) ? 3 : ((speedLevel == 0) ? 7 : 5);
   JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, effort);
+  JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_DECODING_SPEED, speedLevel == 0 ? 1 : 2);
   float distance = JxlEncoderDistanceFromQuality(static_cast<float>(quality));
   JxlEncoderSetFrameDistance(settings, distance);
 
@@ -2409,6 +2685,7 @@ class JpegFirstImageInspector final : public photos_editing_formats::image_io::J
     size_t begin;
     size_t end;
     size_t payloadData;
+    size_t precedingEnd;
   };
   void Start(photos_editing_formats::image_io::JpegScanner* scanner) override {
     photos_editing_formats::image_io::JpegMarker::Flags flags;
@@ -2419,6 +2696,8 @@ class JpegFirstImageInspector final : public photos_editing_formats::image_io::J
                const photos_editing_formats::image_io::JpegSegment& segment) override {
     using photos_editing_formats::image_io::JpegMarker;
     const auto type = segment.GetMarker().GetType();
+    const size_t precedingEnd = previousEnd_;
+    previousEnd_ = segment.GetEnd();
     if (type == JpegMarker::kSOI) {
       if (inside_) { invalid = true; scanner->SetDone(); return; }
       inside_ = true;
@@ -2432,14 +2711,14 @@ class JpegFirstImageInspector final : public photos_editing_formats::image_io::J
         const auto b4 = segment.GetValidatedByte(dataLoc + 4);
         const auto b5 = segment.GetValidatedByte(dataLoc + 5);
         if (b4.is_valid && b5.is_valid && b4.value == 0 && b5.value == 0) {
-          metadata.push_back({true, segment.GetBegin(), segment.GetEnd(), dataLoc});
+          metadata.push_back({true, segment.GetBegin(), segment.GetEnd(), dataLoc, precedingEnd});
         }
       } else if (segment.BytesAtLocationStartWith(dataLoc, "http://ns.adobe.com/xap/1.0/") ||
                  segment.BytesAtLocationStartWith(dataLoc, "http://ns.adobe.com/xmp/extension/")) {
-        metadata.push_back({false, segment.GetBegin(), segment.GetEnd(), dataLoc});
+        metadata.push_back({false, segment.GetBegin(), segment.GetEnd(), dataLoc, precedingEnd});
       }
     } else if (type == 0xed && inside_) {  // APP13 can carry Photoshop/IPTC location records.
-      metadata.push_back({false, segment.GetBegin(), segment.GetEnd(), segment.GetPayloadDataLocation()});
+      metadata.push_back({false, segment.GetBegin(), segment.GetEnd(), segment.GetPayloadDataLocation(), precedingEnd});
     } else if (type == JpegMarker::kEOI) {
       if (!inside_ || firstSos == 0) { invalid = true; scanner->SetDone(); return; }
       firstEoi = segment.GetBegin() + JpegMarker::kLength;
@@ -2448,6 +2727,7 @@ class JpegFirstImageInspector final : public photos_editing_formats::image_io::J
   }
   void Finish(photos_editing_formats::image_io::JpegScanner*) override {}
 
+  size_t previousEnd_ = 0;
   bool inside_ = false;
   bool invalid = false;
   size_t soiBegin = 0;
@@ -2517,7 +2797,12 @@ bool prepareJpegForJxlReconstruction(const std::vector<uint8_t>& srcBytes, bool 
   }
   size_t cursor = 2;
   for (const auto& span : inspector.metadata) {
-    outJpeg.insert(outJpeg.end(), srcBytes.begin() + cursor, srcBytes.begin() + span.begin);
+    size_t copyEnd = span.begin;
+    if (!(keepExif && span.exif)) {
+      // Drop any ITU-T T.81 0xFF fill bytes immediately preceding a stripped segment.
+      while (copyEnd > span.precedingEnd && srcBytes[copyEnd - 1] == 0xFF) --copyEnd;
+    }
+    outJpeg.insert(outJpeg.end(), srcBytes.begin() + cursor, srcBytes.begin() + copyEnd);
     if (keepExif && span.exif) {
       std::vector<uint8_t> payload(srcBytes.begin() + span.payloadData, srcBytes.begin() + span.end);
       ExifEditor editor(payload);
@@ -2769,7 +3054,11 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
   std::vector<uint8_t> deferredGmJpeg;
   std::string err;
   std::vector<uint8_t> iso;
+  std::vector<uint8_t> alternateIcc;
+  std::vector<uint8_t> alternateColorEncoding;
   heif_color_profile_nclx* derived = nullptr;
+  bool hasDecodedBoost = false;
+  float decodedMaxContentBoost = 1.0f;
 
   if (container == 0) {
     std::vector<uint8_t> baseBytes = copyBlock(uhdr_dec_get_base_image(dec));
@@ -2800,6 +3089,13 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
     size_t iccSize = meta->use_base_cg ? baseIcc.size() : mapParser.getICCSize();
     auto gamut = iccSize == 0 && meta->use_base_cg ? UHDR_CG_BT_709 : getGamutFromIcc(static_cast<const uint8_t*>(iccData), iccSize);
     if (gamut == UHDR_CG_UNSPECIFIED) { r.error = "无法原样保留此 HDR 色彩空间，请保留原图"; return -1; }
+    if (opt.outCodec == 3 && !meta->use_base_cg) {
+      alternateIcc = compressJxlIcc(static_cast<const uint8_t*>(iccData), iccSize);
+      if (alternateIcc.empty()) {
+        r.error = "无法写入 JXL 增益图的备用 ICC";
+        return -1;
+      }
+    }
     derived = heif_nclx_color_profile_alloc();
     if (!derived) return -1;
     heif_nclx_color_profile_set_color_primaries(derived, gamut == UHDR_CG_DISPLAY_P3 ? heif_color_primaries_SMPTE_EG_432_1 :
@@ -2838,6 +3134,7 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
       payload.iso = std::move(iso);
       payload.codec = 3;
       payload.multiChannel = multiChannel;
+      payload.alternateIcc = std::move(alternateIcc);
       payload.derivedNclx = derived;
       const int rc = encodeJxlJpegReconstruction(
           reconJpeg, outFd, opt.speedLevel, ultraslim_codec_threads, &payload, err);
@@ -2893,10 +3190,43 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
       return -1;
     }
     iso.assign(layout.iso.data(), layout.iso.data() + layout.iso.size());
+    ultrahdr::uhdr_gainmap_metadata_frac jxlFrac {};
+    ultrahdr::uhdr_gainmap_metadata_ext_t jxlExt {};
+    if (ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso, &jxlFrac).error_code != UHDR_CODEC_OK ||
+        ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&jxlFrac, &jxlExt).error_code != UHDR_CODEC_OK) {
+      r.error = "JXL 增益图元数据异常";
+      return -1;
+    }
+    hasDecodedBoost = true;
+    decodedMaxContentBoost = jxlExt.max_content_boost[0];
+    uhdr_color_gamut_t gamut = UHDR_CG_UNSPECIFIED;
+    if (jxlExt.use_base_cg) {
+      if (base.hasProfile) gamut = gamutFromPrimaries(base.profile.color_primaries);
+      if (gamut == UHDR_CG_UNSPECIFIED) {
+        gamut = base.icc.empty() ? UHDR_CG_BT_709 : getGamutFromIcc(base.icc);
+      }
+    } else if (layout.altIcc.empty() && layout.colorEncoding.empty()) {
+      // Keep the legacy conversion behavior for old JXL exports without a color profile.
+      gamut = UHDR_CG_BT_2100;
+    } else {
+      gamut = getJhgmAlternateGamut(BytesView(jhgm), layout);
+    }
+    if (gamut == UHDR_CG_UNSPECIFIED) {
+      r.error = "无法原样保留此 HDR 色彩空间，请保留原图";
+      return -1;
+    }
+    if (opt.outCodec == 3) {
+      if (!layout.altIcc.empty()) {
+        alternateIcc.assign(layout.altIcc.data(), layout.altIcc.data() + layout.altIcc.size());
+      }
+      if (!layout.colorEncoding.empty()) {
+        alternateColorEncoding.assign(layout.colorEncoding.data(), layout.colorEncoding.data() + layout.colorEncoding.size());
+      }
+    }
     std::vector<uint8_t> gm_stream(layout.codestream.data(), layout.codestream.data() + layout.codestream.size());
     jhgm.clear();
     jhgm.shrink_to_fit();
-    if (!decodeJxlToSdr(gm_stream, gm, nullptr, err)) {
+    if (!decodeJxlToSdr(gm_stream, gm, nullptr, err, 0, UINT64_MAX, /*grayscaleOnly=*/true)) {
       r.error = "解码 JXL 增益图失败: " + err;
       return -1;
     }
@@ -2904,13 +3234,19 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
     gm_stream.shrink_to_fit();
     multiChannel = gm.colorChannels > 1;
     derived = heif_nclx_color_profile_alloc();
-    if (derived) {
-      heif_nclx_color_profile_set_color_primaries(derived, heif_color_primaries_ITU_R_BT_2020_2_and_2100_0);
-      heif_nclx_color_profile_set_transfer_characteristics(derived, heif_transfer_characteristic_ITU_R_BT_2100_0_HLG);
-      heif_nclx_color_profile_set_matrix_coefficients(
-          derived, heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance);
-      derived->full_range_flag = 1;
-    }
+    if (!derived) return -1;
+    heif_nclx_color_profile_set_color_primaries(
+        derived,
+        gamut == UHDR_CG_DISPLAY_P3 ? heif_color_primaries_SMPTE_EG_432_1
+        : gamut == UHDR_CG_BT_2100 ? heif_color_primaries_ITU_R_BT_2020_2_and_2100_0
+                                   : heif_color_primaries_ITU_R_BT_709_5);
+    heif_nclx_color_profile_set_transfer_characteristics(derived, heif_transfer_characteristic_ITU_R_BT_2100_0_HLG);
+    heif_nclx_color_profile_set_matrix_coefficients(
+        derived,
+        gamut == UHDR_CG_DISPLAY_P3 ? heif_matrix_coefficients_chromaticity_derived_non_constant_luminance
+        : gamut == UHDR_CG_BT_2100 ? heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance
+                                   : heif_matrix_coefficients_ITU_R_BT_709_5);
+    derived->full_range_flag = 1;
   } else {
     decOwner.reset();
     dec = nullptr;
@@ -2978,6 +3314,34 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
       } else {
         derived = got;
       }
+      if (opt.outCodec == 3 && !meta->use_base_cg) {
+        auto icc = getHeifDerivedIcc(handle);
+        if (!icc.empty()) {
+          alternateIcc = compressJxlIcc(icc.data(), icc.size());
+        } else if (derived) {
+          // HEIF may signal only NCLX. The map math needs those same primaries.
+          const auto gamut = gamutFromPrimaries(derived->color_primaries);
+          const auto transfer = derived->transfer_characteristics;
+          const auto tf = transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_PQ ? UHDR_CT_PQ
+                        : transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_HLG ? UHDR_CT_HLG
+                        : transfer == heif_transfer_characteristic_linear ? UHDR_CT_LINEAR
+                                                                         : UHDR_CT_SRGB;
+          if (gamut != UHDR_CG_UNSPECIFIED) {
+            const auto profile = ultrahdr::IccHelper::writeIccProfile(tf, gamut);
+            if (profile) {
+              alternateIcc = compressJxlIcc(static_cast<const uint8_t*>(profile->getData()), profile->getLength());
+            }
+          }
+        }
+        if (alternateIcc.empty()) {
+          heif_image_handle_release(gmHandle);
+          heif_image_handle_release(handle);
+          heif_context_free(ctx);
+          if (derived) heif_nclx_color_profile_free(derived);
+          r.error = "无法写入 JXL 增益图的备用 ICC";
+          return -1;
+        }
+      }
       int targetWidth = 0, targetHeight = 0;
       if (opt.resizePercent < 100) scaledSize(srcW, srcH, opt.resizePercent, targetWidth, targetHeight);
       decoded = decodeHeifHandle(handle, base, err, true, 0, UINT64_MAX, targetWidth, targetHeight) &&
@@ -3028,8 +3392,8 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
 
   // Resolve metadata before moving iso into the encoder's retry payload. JXL
   // inputs have no UHDR decoder, so inspecting the moved-from vector loses boost.
-  float maxContentBoost = meta ? meta->max_content_boost[0] : 1.0f;
-  if (!meta) {
+  float maxContentBoost = meta ? meta->max_content_boost[0] : (hasDecodedBoost ? decodedMaxContentBoost : 1.0f);
+  if (!meta && !hasDecodedBoost) {
     ultrahdr::uhdr_gainmap_metadata_frac frac {};
     ultrahdr::uhdr_gainmap_metadata_ext_t ext {};
     if (ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso, &frac).error_code == UHDR_CODEC_OK &&
@@ -3082,6 +3446,8 @@ int tryReuseGainMap(std::vector<uint8_t>& data, int container, DecoderPtr& decOw
     payload.codec = opt.outCodec;
     payload.multiChannel = multiChannel;
     payload.derivedNclx = derived;
+    payload.alternateIcc = std::move(alternateIcc);
+    payload.alternateColorEncoding = std::move(alternateColorEncoding);
     rc = encodeWithRetry(outFd, r.inputBytes, opt.quality, opt.retrySmaller, [&](int quality) {
       return encodeJxl(base, quality, opt.keepExif, outFd, opt.speedLevel,
                         ultraslim_codec_threads, &payload, jxlRgb, opt.retrySmaller, err);
@@ -3544,10 +3910,12 @@ static TranscodeResult transcodeUnchecked(std::vector<uint8_t> data, DecoderPtr 
   ProbeResult memVerified;
   bool verifiedInMemory = false;
   if (r.inputHadGainMap) {
+#if ULTRASLIM_ENABLE_REBUILD
     const int srcW = r.width;
     const int srcH = r.height;
     const int srcGmW = r.gainmapWidth;
     const int srcGmH = r.gainmapHeight;
+#endif
     // Recompress the base and keep the original gain map. Downsampling a fine map
     // destroys highlight boost, so legacy scale/quality options must not degrade
     // it: the map is carried over whenever the output format can hold it, and
@@ -3577,6 +3945,7 @@ static TranscodeResult transcodeUnchecked(std::vector<uint8_t> data, DecoderPtr 
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
       return r;
     }
+#if ULTRASLIM_ENABLE_REBUILD
     r.width = srcW;
     r.height = srcH;
     r.gainmapWidth = srcGmW;
@@ -3696,6 +4065,11 @@ static TranscodeResult transcodeUnchecked(std::vector<uint8_t> data, DecoderPtr 
     { TraceStage trace("output.verify");
       memVerified = probeViews(BytesView(static_cast<const uint8_t*>(out->data), out->data_sz)); }
     verifiedInMemory = true;
+#else
+    r.errorCode = 31;
+    r.error = "当前构建仅支持原样保留 Gain Map";
+    return r;
+#endif
   } else {
     // ---------------- SDR path: decode with libjpeg/libheif, encode with libheif
     if (!options.allowSdrTranscode) {
@@ -4080,6 +4454,203 @@ PreviewBitmapData decodePreviewRgba(int fd, int maxDim, uint64_t maxWorkingBytes
   out.height = sdr.height;
   out.rgba = std::move(sdr.rgba);
   return out;
+}
+
+bool decodePreviewGainmap(int fd, int maxDim, uint64_t maxWorkingBytes, PreviewGainmapData& out) {
+  out = PreviewGainmapData{};
+  if (maxWorkingBytes < 16u * 1024 * 1024) return false;
+  if (ultraslim_codec_threads <= 0) ultraslim_codec_threads = resolveCodecThreads(0);
+  const int limit = std::max(64, std::min(4096, maxDim));
+
+  auto assignMetadata = [&](const uhdr_gainmap_metadata_t& meta) {
+    for (int i = 0; i < 3; ++i) {
+      out.minContentBoost[i] = meta.min_content_boost[i];
+      out.maxContentBoost[i] = meta.max_content_boost[i];
+      out.gamma[i] = meta.gamma[i];
+      out.offsetSdr[i] = meta.offset_sdr[i];
+      out.offsetHdr[i] = meta.offset_hdr[i];
+    }
+    out.hdrCapacityMin = meta.hdr_capacity_min;
+    out.hdrCapacityMax = meta.hdr_capacity_max;
+  };
+  auto packGainmapImage = [&](SdrImage& gm, bool multiChannel) -> bool {
+    if (gm.width <= 0 || gm.height <= 0) return false;
+    const int larger = std::max(gm.width, gm.height);
+    if (larger > limit) {
+      const int nw = static_cast<int>(std::max<int64_t>(1, int64_t(gm.width) * limit / larger));
+      const int nh = static_cast<int>(std::max<int64_t>(1, int64_t(gm.height) * limit / larger));
+      if (!gm.gray.empty() && gm.rgba.empty()) {
+        gm.rgba.resize(static_cast<size_t>(gm.width) * gm.height * 4);
+        for (size_t i = 0; i < gm.gray.size(); ++i) {
+          gm.rgba[i * 4 + 0] = gm.rgba[i * 4 + 1] = gm.rgba[i * 4 + 2] = gm.gray[i];
+          gm.rgba[i * 4 + 3] = 255;
+        }
+        gm.gray.clear();
+      }
+      gm = resizeRgba(gm, nw, nh);
+    }
+    out.width = gm.width;
+    out.height = gm.height;
+    out.singleChannel = !multiChannel;
+    const size_t pixelCount = static_cast<size_t>(gm.width) * gm.height;
+    if (out.singleChannel) {
+      if (!gm.gray.empty() && gm.gray.size() >= pixelCount) {
+        out.pixels = std::move(gm.gray);
+      } else if (gm.rgba.size() >= pixelCount * 4) {
+        out.pixels.resize(pixelCount);
+        rgbaToGrayFast(gm.rgba.data(), out.pixels.data(), pixelCount);
+      } else {
+        return false;
+      }
+    } else {
+      if (gm.rgba.size() < pixelCount * 4) return false;
+      out.pixels = std::move(gm.rgba);
+    }
+    return !out.pixels.empty();
+  };
+
+  HeifFdReader reader(fd);
+  const bool regular = reader.open();
+  const int fdContainer = regular ? reader.container() : -1;
+  std::string err;
+
+  if (fdContainer == 1 || fdContainer == 2) {
+    std::unique_ptr<heif_context, decltype(&heif_context_free)> ctxOwner(heif_context_alloc(), heif_context_free);
+    if (!ctxOwner) return false;
+    reader.position = 0;
+    if (heif_context_read_from_reader(ctxOwner.get(), &HeifFdReader::callbacks(), &reader, nullptr).code != heif_error_Ok) {
+      return false;
+    }
+    heif_image_handle* handle = nullptr;
+    if (heif_context_get_primary_image_handle(ctxOwner.get(), &handle).code != heif_error_Ok || !handle) return false;
+    std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> handleOwner(handle, heif_image_handle_release);
+    heif_image_handle* gmHandle = nullptr;
+    if (heif_image_handle_get_gain_map_image_handle(handle, &gmHandle).code != heif_error_Ok || !gmHandle) return false;
+    std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> gmOwner(gmHandle, heif_image_handle_release);
+    const size_t metaSize = heif_image_handle_get_gain_map_metadata_size(handle);
+    if (metaSize == 0 || metaSize > kMaxBoxBytes) return false;
+    std::vector<uint8_t> iso(metaSize);
+    if (heif_image_handle_get_gain_map_metadata(handle, iso.data()).code != heif_error_Ok) return false;
+    ultrahdr::uhdr_gainmap_metadata_frac frac {};
+    ultrahdr::uhdr_gainmap_metadata_ext_t ext {};
+    if (ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso, &frac).error_code != UHDR_CODEC_OK ||
+        ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&frac, &ext).error_code != UHDR_CODEC_OK) {
+      return false;
+    }
+    assignMetadata(ext);
+    if (!ext.use_base_cg) {
+      const auto icc = getHeifDerivedIcc(handle);
+      if (!icc.empty()) {
+        out.alternatePrimaries = primariesForGamut(getGamutFromIcc(icc));
+      } else {
+        heif_color_profile_nclx* profile = nullptr;
+        const auto status = heif_image_handle_get_derived_image_nclx_color_profile(handle, &profile);
+        const NclxPtr owner(profile);
+        if (status.code != heif_error_Ok || !owner) return false;
+        out.alternatePrimaries = primariesForGamut(gamutFromPrimaries(owner->color_primaries));
+      }
+      if (out.alternatePrimaries == heif_color_primaries_unspecified) return false;
+    }
+    heif_colorspace cs = heif_colorspace_undefined;
+    heif_chroma ch = heif_chroma_undefined;
+    // Compatible 4:2:0 maps may have different RGB samples even with identical channel metadata.
+    const bool mono = heif_image_handle_get_preferred_decoding_colorspace(gmHandle, &cs, &ch).code == heif_error_Ok &&
+                      ch == heif_chroma_monochrome;
+    SdrImage gm;
+    if (!decodeHeifHandle(gmHandle, gm, err, false, limit, maxWorkingBytes)) return false;
+    return packGainmapImage(gm, !mono);
+  }
+
+  struct stat st {};
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && uint64_t(st.st_size) > maxWorkingBytes) return false;
+  std::vector<uint8_t> data = readAll(fd, maxWorkingBytes);
+  if (data.empty() || data.size() > maxWorkingBytes) return false;
+  const int container = sniffContainer(data.data(), data.size());
+  if (container == 3) {
+    JxlDecoder* dec = JxlDecoderCreate(nullptr);
+    if (!dec) return false;
+    std::vector<uint8_t> jhgmBox;
+    if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BOX | JXL_DEC_BOX_COMPLETE) == JXL_DEC_SUCCESS) {
+      JxlDecoderSetDecompressBoxes(dec, JXL_TRUE);
+      JxlDecoderSetInput(dec, data.data(), data.size());
+      JxlDecoderCloseInput(dec);
+      std::vector<uint8_t> curr;
+      JxlBoxType type = {0};
+      for (;;) {
+        const JxlDecoderStatus s = JxlDecoderProcessInput(dec);
+        if (s == JXL_DEC_ERROR || s == JXL_DEC_SUCCESS) break;
+        if (s == JXL_DEC_BOX) {
+          if (JxlDecoderGetBoxType(dec, type, JXL_TRUE) == JXL_DEC_SUCCESS && memcmp(type, "jhgm", 4) == 0) {
+            uint64_t rawSize = 0;
+            curr.resize((JxlDecoderGetBoxSizeContents(dec, &rawSize) == JXL_DEC_SUCCESS && rawSize > 0 && rawSize < kMaxBoxBytes)
+                            ? static_cast<size_t>(rawSize) : 64 * 1024);
+            JxlDecoderSetBoxBuffer(dec, curr.data(), curr.size());
+          }
+        } else if (s == JXL_DEC_BOX_NEED_MORE_OUTPUT) {
+          const size_t rem = JxlDecoderReleaseBoxBuffer(dec);
+          const size_t used = curr.size() - rem;
+          if (curr.size() * 2 > kMaxBoxBytes) { curr.clear(); break; }
+          curr.resize(curr.size() * 2);
+          JxlDecoderSetBoxBuffer(dec, curr.data() + used, curr.size() - used);
+        } else if (s == JXL_DEC_BOX_COMPLETE) {
+          const size_t rem = JxlDecoderReleaseBoxBuffer(dec);
+          curr.resize(curr.size() - rem);
+          if (memcmp(type, "jhgm", 4) == 0) { jhgmBox = std::move(curr); break; }
+          curr.clear();
+        }
+      }
+    }
+    JxlDecoderDestroy(dec);
+    data.clear();
+    data.shrink_to_fit();
+    if (jhgmBox.empty()) return false;
+    JhgmLayout layout;
+    if (!parseJhgmLayout(BytesView(jhgmBox), layout)) return false;
+    std::vector<uint8_t> iso(layout.iso.data(), layout.iso.data() + layout.iso.size());
+    ultrahdr::uhdr_gainmap_metadata_frac frac {};
+    ultrahdr::uhdr_gainmap_metadata_ext_t ext {};
+    if (ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(iso, &frac).error_code != UHDR_CODEC_OK ||
+        ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&frac, &ext).error_code != UHDR_CODEC_OK) {
+      return false;
+    }
+    assignMetadata(ext);
+    if (!ext.use_base_cg) {
+      out.alternatePrimaries = primariesForGamut(getJhgmAlternateGamut(BytesView(jhgmBox), layout));
+      if (out.alternatePrimaries == heif_color_primaries_unspecified) return false;
+    }
+    std::vector<uint8_t> gmStream(layout.codestream.data(), layout.codestream.data() + layout.codestream.size());
+    jhgmBox.clear();
+    SdrImage gm;
+    if (!decodeJxlToSdr(gmStream, gm, nullptr, err, limit, maxWorkingBytes, /*grayscaleOnly=*/true)) return false;
+    return packGainmapImage(gm, gm.colorChannels > 1);
+  }
+  if (container == 0) {
+    DecoderPtr dec;
+    if (!probeWithUhdr(BytesView(data), nullptr, nullptr, &dec) || !dec) return false;
+    uhdr_gainmap_metadata_t* meta = uhdr_dec_get_gainmap_metadata(dec.get());
+    if (!meta) return false;
+    assignMetadata(*meta);
+    const bool useBaseGamut = meta->use_base_cg;
+    std::vector<uint8_t> exif = copyBlock(uhdr_dec_get_exif(dec.get()));
+    std::vector<uint8_t> gmBytes = copyBlock(uhdr_dec_get_gainmap_image(dec.get()));
+    dec.reset();
+    data.clear();
+    data.shrink_to_fit();
+    const int channels = jpegChannels(gmBytes);
+    if (channels <= 0) return false;
+    if (!useBaseGamut) {
+      ultrahdr::JpegDecoderHelper mapParser;
+      if (mapParser.parseImage(gmBytes.data(), gmBytes.size()).error_code != UHDR_CODEC_OK) return false;
+      out.alternatePrimaries = primariesForGamut(getGamutFromIcc(
+          static_cast<const uint8_t*>(mapParser.getICCPtr()), mapParser.getICCSize()));
+      if (out.alternatePrimaries == heif_color_primaries_unspecified) return false;
+    }
+    SdrImage gm;
+    if (!decodeJpegSdr(gmBytes, gm, err, limit, maxWorkingBytes, /*grayscaleOnly=*/channels == 1)) return false;
+    orientPixels(gm, ExifEditor(exif).orientation());
+    return packGainmapImage(gm, channels > 1);
+  }
+  return false;
 }
 
 std::vector<uint8_t> decodePreviewJpeg(int fd, int maxDim, int quality, uint64_t maxWorkingBytes) {

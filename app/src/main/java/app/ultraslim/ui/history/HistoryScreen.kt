@@ -122,10 +122,21 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
     }
     val selectionReady = selectedItems.size == selected.size
     val pendingCount = remember(selectedItems) { selectedItems.count { it.saveState != "SAVED" } }
-    LaunchedEffect(visible, selectedItems) {
-        vm.ensureTrashableResolved((visible + selectedItems).distinctBy { it.id })
+    LaunchedEffect(visible, selection.items) {
+        vm.ensureTrashableResolved((visible + selection.items).distinctBy { it.id })
     }
-    val groups = remember(visible) { visible.groupBy { historyDate(it.createdAt) } }
+    val dateGroups = remember(visible) {
+        visible.groupBy { historyDate(it.createdAt) }.map { (date, records) ->
+            HistoryDateGroup(
+                date = date,
+                title = historyDateTitle(date),
+                records = records,
+                savedBytes = records.sumOf { it.inputBytes - it.outputBytes },
+                ids = records.mapTo(HashSet(records.size * 2)) { it.id },
+            )
+        }
+    }
+    val groupDates = remember(dateGroups) { dateGroups.mapTo(LinkedHashSet(dateGroups.size * 2)) { it.date } }
     val railMode = NavigationSuiteScaffoldDefaults.navigationSuiteType(currentWindowAdaptiveInfoV2()) == NavigationSuiteType.WideNavigationRailCollapsed
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
 
@@ -232,12 +243,12 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        if (groups.size > 1) {
-                            val allCollapsed = collapsedDates.containsAll(groups.keys)
+                        if (dateGroups.size > 1) {
+                            val allCollapsed = collapsedDates.containsAll(groupDates)
                             TextButton(
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                                 onClick = {
-                                    collapsedDates = if (allCollapsed) emptySet<LocalDate>() else groups.keys
+                                    collapsedDates = if (allCollapsed) emptySet<LocalDate>() else groupDates
                                 }
                             ) {
                                 Text(if (allCollapsed) "展开全部" else "折叠全部", style = MaterialTheme.typography.labelSmall)
@@ -267,7 +278,9 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                 }
             }
             // 行级虚拟化：展开态的每条记录是独立 item；单个自然日 500 张也不会一次性组合。
-            groups.forEach { (date, records) ->
+            dateGroups.forEach { group ->
+                val date = group.date
+                val records = group.records
                 val isCollapsed = date in collapsedDates
                 item(key = "date-group-$date", contentType = "history-header") {
                     app.ultraslim.ui.components.CommitSwipeRow(
@@ -289,9 +302,9 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             BatchGroupHeader(
-                                title = historyDateTitle(date),
+                                title = group.title,
                                 count = records.size,
-                                savedBytes = records.sumOf { it.inputBytes - it.outputBytes },
+                                savedBytes = group.savedBytes,
                                 collapsible = true,
                                 collapsed = isCollapsed,
                                 onToggleCollapse = {
@@ -299,7 +312,7 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                                 },
                                 action = {
                                     if (selecting) {
-                                        val ids = records.map { it.id }.toSet()
+                                        val ids = group.ids
                                         val allSelected = selected.containsAll(ids)
                                         TextButton(enabled = !state.busyNow, onClick = {
                                             selected = if (allSelected) selected - ids else selected + ids
@@ -308,7 +321,7 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
                                             Text(if (allSelected) "取消当天" else "选择当天")
                                         }
                                     } else IconButton(onClick = { vm.requestDeleteDate(date, filter) }, enabled = !state.busyNow) {
-                                        Icon(Icons.Rounded.DeleteOutline, "删除${historyDateTitle(date)}的记录")
+                                        Icon(Icons.Rounded.DeleteOutline, "删除${group.title}的记录")
                                     }
                                 }
                             )
@@ -364,6 +377,14 @@ fun HistoryScreen(onOpenDetail: (Long) -> Unit, onSelectingChange: (Boolean) -> 
         dismissButton = { TextButton(onClick = { confirmBusyLeave = false }) { Text("继续") } })
 }
 
+private data class HistoryDateGroup(
+    val date: LocalDate,
+    val title: String,
+    val records: List<HistoryEntity>,
+    val savedBytes: Long,
+    val ids: Set<Long>,
+)
+
 @Composable
 internal fun HistoryRow(entity: HistoryEntity, selecting: Boolean, checked: Boolean, enabled: Boolean,
     onClick: () -> Unit, modifier: Modifier = Modifier, active: Boolean = false) {
@@ -373,8 +394,10 @@ internal fun HistoryRow(entity: HistoryEntity, selecting: Boolean, checked: Bool
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             if (selecting) Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
             val thumbMaxDim = app.ultraslim.ui.components.rememberThumbMaxDim()
+            val preferNative = entity.format.equals("JXL", ignoreCase = true) ||
+                (entity.hadGainMap && entity.format.equals("HEIC", ignoreCase = true) && android.os.Build.VERSION.SDK_INT <= 35)
             UltraAsyncImage(entity.outputUri, null, ContentScale.Crop, Modifier.padding(start = if (selecting) 8.dp else 0.dp)
-                .size(72.dp).clip(RoundedCornerShape(14.dp)), thumbMaxDim)
+                .size(72.dp).clip(RoundedCornerShape(14.dp)), thumbMaxDim, preferNative = preferNative)
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(entity.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
                 Text("${entity.format} · ${entity.width} × ${entity.height}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

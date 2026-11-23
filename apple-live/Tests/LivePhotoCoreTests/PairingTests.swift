@@ -8,7 +8,9 @@ final class PairingTests: XCTestCase {
     func testPresentationTimestampIsNotOffsetTwice() throws {
         XCTAssertEqual(try LivePhotoImport.photoTime(timestampUs:3_000_000,start:2,duration:4),3)
         XCTAssertEqual(try LivePhotoImport.photoTime(timestampUs:-1,start:2,duration:4),4)
+        XCTAssertEqual(try LivePhotoImport.photoTime(timestampUs:6_050_000,start:2,duration:4),6.0 - 1.0 / 600.0,accuracy:1e-6)
         XCTAssertThrowsError(try LivePhotoImport.photoTime(timestampUs:1_000_000,start:2,duration:4))
+        XCTAssertThrowsError(try LivePhotoImport.photoTime(timestampUs:6_200_000,start:2,duration:4))
     }
     func testMetadataPairingKeepsCodedItemsForImageWithoutExif() throws {
         let dir=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -29,6 +31,12 @@ final class PairingTests: XCTestCase {
         let exif=properties[kCGImagePropertyExifDictionary as String] as! [String:Any]
         XCTAssertEqual(exif[kCGImagePropertyExifPixelXDimension as String] as? Int,64)
         XCTAssertEqual(exif[kCGImagePropertyExifPixelYDimension as String] as? Int,48)
+        let topAfter=try HEICPairing.boxes(after,0,after.count)
+        let metaAfter=try XCTUnwrap(topAfter.last(where:{$0.type=="meta"}))
+        let iinfAfter=try XCTUnwrap(try HEICPairing.boxes(after,metaAfter.payload+4,metaAfter.end).first(where:{$0.type=="iinf"}))
+        let infes=try HEICPairing.boxes(after,iinfAfter.payload+(after[iinfAfter.payload]==0 ? 6:8),iinfAfter.end)
+        let exifInfe=try XCTUnwrap(infes.first(where:{ b in b.payload+8+4<=b.end && String(decoding:after[b.payload+8..<b.payload+12],as:UTF8.self)=="Exif" }))
+        XCTAssertEqual(exifInfe.end - exifInfe.start, 21, "ISO 14496-12 v2 Exif infe box must be 21 bytes without trailing duplicate name")
     }
     /** App 产出的 HEIC 常态自带 Exif item：配对走「替换 extents + 保留 cdsc」分支。 */
     func testMetadataPairingReplacesExistingExifItemWithoutReencode() throws {

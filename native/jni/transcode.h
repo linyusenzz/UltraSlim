@@ -72,6 +72,21 @@ struct PreviewBitmapData {
   int colorSpace = 0;  // 0 = sRGB, 1 = Display P3, 2 = BT.2020, 3 = linear sRGB
 };
 
+struct PreviewGainmapData {
+  std::vector<uint8_t> pixels;  // 1B/px when singleChannel == true, else RGBA8888 (4B/px)
+  int width = 0;
+  int height = 0;
+  bool singleChannel = true;
+  float minContentBoost[3] = {1.0f, 1.0f, 1.0f};
+  float maxContentBoost[3] = {1.0f, 1.0f, 1.0f};
+  float gamma[3] = {1.0f, 1.0f, 1.0f};
+  float offsetSdr[3] = {0.0f, 0.0f, 0.0f};
+  float offsetHdr[3] = {0.0f, 0.0f, 0.0f};
+  float hdrCapacityMin = 1.0f;
+  float hdrCapacityMax = 1.0f;
+  int alternatePrimaries = 0;  // CICP primaries, or zero to use the base gamut.
+};
+
 struct TranscodeResult {
   int errorCode = 0;
   std::string error;
@@ -105,6 +120,8 @@ std::vector<uint8_t> decodePreviewJpeg(int fd, int maxDim, int quality = 82,
                                      uint64_t maxWorkingBytes = UINT64_MAX);
 PreviewBitmapData decodePreviewRgba(int fd, int maxDim,
                                     uint64_t maxWorkingBytes = UINT64_MAX);
+bool decodePreviewGainmap(int fd, int maxDim, uint64_t maxWorkingBytes,
+                          PreviewGainmapData& out);
 
 /** Debug: decode the primary image with heif_chroma_undefined and return the raw Y plane. */
 std::vector<uint8_t> debugDecodePlaneY(int fd, int& w, int& h);

@@ -81,6 +81,9 @@ class ConversionRepository(private val dao: TaskDao, scope: CoroutineScope) {
     init {
         scope.launch {
             try {
+                // Batch creation awaits ready, so startup pruning cannot race its first task write.
+                dao.pruneUnreferencedBatches()
+                dao.restorePublishedTaskOutputs()
                 val initial = dao.all()
                 persisted.putAll(initial.associateBy { it.id })
                 synchronized(this@ConversionRepository) {

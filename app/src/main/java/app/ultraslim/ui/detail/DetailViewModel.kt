@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 sealed interface DetailEvent {
@@ -125,13 +126,12 @@ class DetailViewModel internal constructor(
         saving.value = true
         viewModelScope.launch {
             try {
+                // AppleLiveExporter cleans up incomplete SAF documents on IO upon failure/cancellation.
                 AppleLiveExporter.export(app, entity, uri)
                 _events.emit(DetailEvent.Message("已导出。请在 Mac 上用 UltraSlim Live 打开 ZIP 并导入「照片」"))
             } catch (e: kotlinx.coroutines.CancellationException) {
-                runCatching { android.provider.DocumentsContract.deleteDocument(app.contentResolver, uri) }
                 throw e
             } catch (e: Exception) {
-                runCatching { android.provider.DocumentsContract.deleteDocument(app.contentResolver, uri) }
                 _events.emit(DetailEvent.Message("Apple Live Photo 导出失败：${e.message}"))
             } finally { saving.value = false }
         }
@@ -144,11 +144,22 @@ class DetailViewModel internal constructor(
             saving.value = true
             try {
                 withContext(Dispatchers.IO) {
-                    app.contentResolver.openInputStream(OutputStore.uri(app, entity.outputUri))!!.use { input ->
-                        app.contentResolver.openOutputStream(uri)!!.use { output -> input.copyTo(output) }
+                    val source = OutputStore.uri(app, entity.outputUri)
+                    try {
+                        app.contentResolver.openInputStream(source)!!.use { input ->
+                            app.contentResolver.openOutputStream(uri, "wt")!!.use { output ->
+                                input.copyTo(output, 128 * 1024)
+                                output.flush()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        runCatching { android.provider.DocumentsContract.deleteDocument(app.contentResolver, uri) }
+                        throw e
                     }
                 }
                 _events.emit(DetailEvent.Message("文件已导出"))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _events.emit(DetailEvent.Message("导出失败：${e.message}"))
             } finally {
@@ -163,8 +174,10 @@ class DetailViewModel internal constructor(
         viewModelScope.launch {
             saving.value = true
             try {
-                val durable = withContext(Dispatchers.IO) { InputStore.persist(app, uri, java.util.UUID.randomUUID().toString()) }
-                dao.update(row.copy(inputUri = durable.toString()))
+                InputStore.referenceLock.withLock {
+                    val durable = withContext(Dispatchers.IO) { InputStore.persist(app, uri, java.util.UUID.randomUUID().toString()) }
+                    dao.update(row.copy(inputUri = durable.toString()))
+                }
                 // entityFlow performs the one provider check on IO for the new URI.
                 _events.emit(DetailEvent.Message("原图已重新关联"))
             } catch (e: Exception) {

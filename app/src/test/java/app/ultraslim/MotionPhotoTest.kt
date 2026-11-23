@@ -142,6 +142,41 @@ class MotionPhotoTest {
         assertNull(detect(jpeg().copyOf(jpeg().size - 1) + ByteArray(64)))
         assertNull(detect(box("ftyp", "heic0000".toByteArray()) + box("meta", ByteArray(8))))
         assertNull(detect(jpeg() + video(4096) + byteArrayOf(1, 2, 3, 4)))
+        // Naked JXL codestream (0xFF 0x0A) short-circuits immediately, even if followed by MP4-like bytes.
+        assertNull(detect(byteArrayOf(-1, 0x0a, 1, 2, 3, 4, 5, 6) + video(4096)))
+    }
+
+    @Test fun stillEndOffsetTracksExactStillPrefixAcrossJpegHeicAndAvif() {
+        val movie = video(65536)
+        val info = MotionPhotoInfo(42000, movie.size.toLong(), 0)
+        val jpegStill = MotionPhotoContainer.jpegWithXmp(jpeg(), info)
+        val jpegDetected = detect(jpegStill + movie)!!
+        assertEquals(jpegStill.size.toLong(), jpegDetected.stillEndOffset)
+
+        val heicStill = box("ftyp", "heic0000".toByteArray()) + box("meta", ByteArray(12))
+        val heicXmp = MotionPhotoContainer.xmp(info, "image/heic").toString(Charsets.UTF_8)
+        val heicDetected = detect(heicStill + box("mpvd", movie), heicXmp)!!
+        assertEquals(heicStill.size.toLong(), heicDetected.stillEndOffset)
+        assertEquals(heicStill.size + 8L, heicDetected.videoOffset)
+
+        val avifStill = box("ftyp", "avif0000".toByteArray()) + box("meta", ByteArray(12))
+        val avifXmp = MotionPhotoContainer.xmp(info, "image/avif").toString(Charsets.UTF_8)
+        val avifDetected = detect(avifStill + box("mpvd", movie), avifXmp)!!
+        assertEquals(avifStill.size.toLong(), avifDetected.stillEndOffset)
+
+        val vendorHeicDetected = detect(heicStill + movie)!!
+        assertEquals(heicStill.size.toLong(), vendorHeicDetected.stillEndOffset)
+    }
+
+    @Test fun jpegXmpHandlesItuFillBytesBeforeApp1Marker() {
+        val movie = video(4096)
+        val xmp = """<x:xmpmeta xmlns:x='adobe:ns:meta/' xmlns:r='http://www.w3.org/1999/02/22-rdf-syntax-ns#' xmlns:c='http://ns.google.com/photos/1.0/camera/'><r:RDF><r:Description c:MotionPhoto='1' c:MicroVideoOffset='4096' c:MotionPhotoPresentationTimestampUs='777'/></r:RDF></x:xmpmeta>"""
+        val payload = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray() + xmp.toByteArray()
+        val segment = ByteBuffer.allocate(payload.size + 4).putShort(0xffe1.toShort())
+            .putShort((payload.size + 2).toShort()).put(payload).array()
+        val fillPrefixedJpeg = byteArrayOf(-1, -40, -1, -1) + segment + byteArrayOf(-1, -39)
+        val detected = detect(fillPrefixedJpeg + movie)
+        assertEquals(MotionPhotoInfo(777, 4096, fillPrefixedJpeg.size.toLong()), detected)
     }
 
     @Test fun exactCopyRejectsTruncation() {

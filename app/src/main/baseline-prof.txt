@@ -1,18 +1,28 @@
 # Baseline profile rules for UltraSlim startup, Compose navigation, and list scrolling.
+# Startup (S) is reserved for cold-start critical classes; post-startup hot paths use HPL.
 HSPLapp/ultraslim/UltraSlimApp;-><init>()V
 HSPLapp/ultraslim/UltraSlimApp;->**(**)**
 HSPLapp/ultraslim/MainActivity;-><init>()V
 HSPLapp/ultraslim/MainActivity;->**(**)**
 HSPLapp/ultraslim/ui/AppRootKt;->**(**)**
+HSPLapp/ultraslim/ui/AppViewModelKt;->**(**)**
+HSPLapp/ultraslim/ui/DeferredOutputHostKt;->**(**)**
+HSPLapp/ultraslim/ui/AutoReplacementHostKt;->**(**)**
+HSPLapp/ultraslim/ui/ComposableSingletons$*;->**(**)**
 HSPLapp/ultraslim/ui/home/**;->**(**)**
 HSPLapp/ultraslim/ui/history/**;->**(**)**
-HSPLapp/ultraslim/ui/detail/**;->**(**)**
 HSPLapp/ultraslim/ui/components/**;->**(**)**
 HSPLapp/ultraslim/ui/adaptive/**;->**(**)**
 HSPLapp/ultraslim/ui/theme/**;->**(**)**
-HSPLapp/ultraslim/data/**;->**(**)**
-HSPLapp/ultraslim/convert/**;->**(**)**
-HSPLapp/ultraslim/bridge/**;->**(**)**
+HSPLapp/ultraslim/data/SettingsRepository**;->**(**)**
+HSPLapp/ultraslim/data/HistoryRepository**;->**(**)**
+HSPLapp/ultraslim/convert/ConversionRepository**;->**(**)**
+HSPLapp/ultraslim/convert/ImageWork**;->**(**)**
 HSPLapp/ultraslim/model/**;->**(**)**
 HSPLapp/ultraslim/util/**;->**(**)**
+HPLapp/ultraslim/ui/detail/**;->**(**)**
+HPLapp/ultraslim/ui/settings/**;->**(**)**
+HPLapp/ultraslim/data/**;->**(**)**
+HPLapp/ultraslim/convert/**;->**(**)**
+HPLapp/ultraslim/bridge/**;->**(**)**
 Lapp/ultraslim/**;

@@ -11,6 +11,10 @@
 #include <android/bitmap.h>
 #endif
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "transcode.h"
 
 namespace {
@@ -143,10 +147,11 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
     JNIEnv* env, jclass /*unused*/, jint fd, jint maxDim, jlong maxWorkingBytes) {
 #if defined(__ANDROID__)
   if (maxWorkingBytes <= 0) return nullptr;
+  const int clampedDim = std::max(64, std::min(4096, int(maxDim)));
   ultraslim::PreviewBitmapData decoded;
   try {
     decoded = ultraslim::decodePreviewRgba(
-        static_cast<int>(fd), std::max(64, std::min(4096, int(maxDim))),
+        static_cast<int>(fd), clampedDim,
         static_cast<uint64_t>(maxWorkingBytes));
   } catch (const std::exception&) {
     return nullptr;
@@ -157,8 +162,10 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
 
   struct PreviewBitmapIds {
     jclass bitmapCls = nullptr;
-    jmethodID createBitmap = nullptr;
+    jmethodID createBitmap5 = nullptr;
+    jmethodID createBitmap3 = nullptr;
     jobject argb8888 = nullptr;
+    jobject rgb565 = nullptr;
     jobject csSrgb = nullptr;
     jobject csDisplayP3 = nullptr;
     jobject csBt2020 = nullptr;
@@ -175,15 +182,23 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
       return out;
     }
     out.bitmapCls = static_cast<jclass>(env->NewGlobalRef(bmpLocal));
-    out.createBitmap = env->GetStaticMethodID(
+    out.createBitmap5 = env->GetStaticMethodID(
         out.bitmapCls, "createBitmap",
         "(IILandroid/graphics/Bitmap$Config;ZLandroid/graphics/ColorSpace;)Landroid/graphics/Bitmap;");
-    jfieldID cfgField = env->GetStaticFieldID(cfgLocal, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
-    jobject cfgObj = cfgField ? env->GetStaticObjectField(cfgLocal, cfgField) : nullptr;
-    if (cfgObj) {
-      out.argb8888 = env->NewGlobalRef(cfgObj);
-      env->DeleteLocalRef(cfgObj);
-    }
+    out.createBitmap3 = env->GetStaticMethodID(
+        out.bitmapCls, "createBitmap",
+        "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+    auto resolveCfg = [&](const char* name) -> jobject {
+      jfieldID f = env->GetStaticFieldID(cfgLocal, name, "Landroid/graphics/Bitmap$Config;");
+      if (!f) { env->ExceptionClear(); return nullptr; }
+      jobject obj = env->GetStaticObjectField(cfgLocal, f);
+      if (!obj) return nullptr;
+      jobject g = env->NewGlobalRef(obj);
+      env->DeleteLocalRef(obj);
+      return g;
+    };
+    out.argb8888 = resolveCfg("ARGB_8888");
+    out.rgb565 = resolveCfg("RGB_565");
     jmethodID getCs = env->GetStaticMethodID(
         csLocal, "get", "(Landroid/graphics/ColorSpace$Named;)Landroid/graphics/ColorSpace;");
     auto resolveCs = [&](const char* name) -> jobject {
@@ -210,7 +225,7 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
     return out;
   }();
 
-  if (!ids.bitmapCls || !ids.createBitmap || !ids.argb8888 || !ids.csSrgb) return nullptr;
+  if (!ids.bitmapCls || !ids.createBitmap5 || !ids.argb8888 || !ids.csSrgb) return nullptr;
 
   bool hasAlpha = false;
   const uint8_t* src = decoded.rgba.data();
@@ -219,12 +234,19 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
     if (src[i * 4 + 3] != 255) { hasAlpha = true; break; }
   }
 
-  jobject cs = decoded.colorSpace == 1 && ids.csDisplayP3 ? ids.csDisplayP3
-             : decoded.colorSpace == 2 && ids.csBt2020 ? ids.csBt2020
-             : decoded.colorSpace == 3 ? ids.csLinearSrgb : ids.csSrgb;
-  jobject bitmap = env->CallStaticObjectMethod(
-      ids.bitmapCls, ids.createBitmap, w, h, ids.argb8888,
-      hasAlpha ? JNI_TRUE : JNI_FALSE, cs);
+  const bool useRgb565 = clampedDim <= 512 && !hasAlpha && decoded.colorSpace == 0 &&
+                         ids.createBitmap3 != nullptr && ids.rgb565 != nullptr;
+  jobject bitmap = nullptr;
+  if (useRgb565) {
+    bitmap = env->CallStaticObjectMethod(ids.bitmapCls, ids.createBitmap3, w, h, ids.rgb565);
+  } else {
+    jobject cs = decoded.colorSpace == 1 && ids.csDisplayP3 ? ids.csDisplayP3
+               : decoded.colorSpace == 2 && ids.csBt2020 ? ids.csBt2020
+               : decoded.colorSpace == 3 ? ids.csLinearSrgb : ids.csSrgb;
+    bitmap = env->CallStaticObjectMethod(
+        ids.bitmapCls, ids.createBitmap5, w, h, ids.argb8888,
+        hasAlpha ? JNI_TRUE : JNI_FALSE, cs);
+  }
   if (env->ExceptionCheck() || !bitmap) {
     env->ExceptionClear();
     return nullptr;
@@ -233,7 +255,6 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
   AndroidBitmapInfo info {};
   void* dstPixels = nullptr;
   if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
-      info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
       AndroidBitmap_lockPixels(env, bitmap, &dstPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
       !dstPixels) {
     return nullptr;
@@ -241,11 +262,36 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
 
   auto* dstBytes = static_cast<uint8_t*>(dstPixels);
   const size_t rowBytes = static_cast<size_t>(w) * 4;
-  if (!hasAlpha) {
+  if (useRgb565 && info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* sRow = src + static_cast<size_t>(y) * rowBytes;
+      auto* dRow = reinterpret_cast<uint16_t*>(dstBytes + static_cast<size_t>(y) * info.stride);
+      int x = 0;
+#if defined(__ARM_NEON)
+      for (; x + 16 <= w; x += 16) {
+        const uint8x16x4_t rgba = vld4q_u8(sRow + static_cast<size_t>(x) * 4);
+        const uint16x8_t rLo = vshlq_n_u16(vmovl_u8(vshr_n_u8(vget_low_u8(rgba.val[0]), 3)), 11);
+        const uint16x8_t gLo = vshlq_n_u16(vmovl_u8(vshr_n_u8(vget_low_u8(rgba.val[1]), 2)), 5);
+        const uint16x8_t bLo = vmovl_u8(vshr_n_u8(vget_low_u8(rgba.val[2]), 3));
+        const uint16x8_t rHi = vshlq_n_u16(vmovl_u8(vshr_n_u8(vget_high_u8(rgba.val[0]), 3)), 11);
+        const uint16x8_t gHi = vshlq_n_u16(vmovl_u8(vshr_n_u8(vget_high_u8(rgba.val[1]), 2)), 5);
+        const uint16x8_t bHi = vmovl_u8(vshr_n_u8(vget_high_u8(rgba.val[2]), 3));
+        vst1q_u16(dRow + x, vorrq_u16(vorrq_u16(rLo, gLo), bLo));
+        vst1q_u16(dRow + x + 8, vorrq_u16(vorrq_u16(rHi, gHi), bHi));
+      }
+#endif
+      for (; x < w; ++x) {
+        const uint16_t r5 = static_cast<uint16_t>(sRow[x * 4 + 0] >> 3);
+        const uint16_t g6 = static_cast<uint16_t>(sRow[x * 4 + 1] >> 2);
+        const uint16_t b5 = static_cast<uint16_t>(sRow[x * 4 + 2] >> 3);
+        dRow[x] = static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5);
+      }
+    }
+  } else if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888 && !hasAlpha) {
     for (int y = 0; y < h; ++y) {
       std::memcpy(dstBytes + static_cast<size_t>(y) * info.stride, src + static_cast<size_t>(y) * rowBytes, rowBytes);
     }
-  } else {
+  } else if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
     for (int y = 0; y < h; ++y) {
       const uint8_t* sRow = src + static_cast<size_t>(y) * rowBytes;
       uint8_t* dRow = dstBytes + static_cast<size_t>(y) * info.stride;
@@ -263,11 +309,105 @@ JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeP
         }
       }
     }
+  } else {
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return nullptr;
   }
   AndroidBitmap_unlockPixels(env, bitmap);
   return bitmap;
 #else
   (void)env; (void)fd; (void)maxDim; (void)maxWorkingBytes;
+  return nullptr;
+#endif
+}
+
+JNIEXPORT jobject JNICALL Java_app_ultraslim_bridge_UltraHdrBridge_nativeDecodeGainmapBitmap(
+    JNIEnv* env, jclass /*unused*/, jint fd, jint maxDim, jlong maxWorkingBytes, jfloatArray outMetadata) {
+#if defined(__ANDROID__)
+  if (maxWorkingBytes <= 0 || outMetadata == nullptr || env->GetArrayLength(outMetadata) < 18) return nullptr;
+  ultraslim::PreviewGainmapData gm;
+  try {
+    if (!ultraslim::decodePreviewGainmap(
+            static_cast<int>(fd), std::max(64, std::min(4096, int(maxDim))),
+            static_cast<uint64_t>(maxWorkingBytes), gm)) {
+      return nullptr;
+    }
+  } catch (const std::exception&) {
+    return nullptr;
+  }
+  if (gm.width <= 0 || gm.height <= 0 || gm.pixels.empty()) return nullptr;
+
+  struct GainmapBitmapIds {
+    jclass bitmapCls = nullptr;
+    jmethodID createBitmap3 = nullptr;
+    jobject alpha8 = nullptr;
+    jobject argb8888 = nullptr;
+  };
+  static const GainmapBitmapIds ids = [env] {
+    GainmapBitmapIds out;
+    jclass bmpLocal = env->FindClass("android/graphics/Bitmap");
+    jclass cfgLocal = env->FindClass("android/graphics/Bitmap$Config");
+    if (!bmpLocal || !cfgLocal) { env->ExceptionClear(); return out; }
+    out.bitmapCls = static_cast<jclass>(env->NewGlobalRef(bmpLocal));
+    out.createBitmap3 = env->GetStaticMethodID(
+        out.bitmapCls, "createBitmap", "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+    auto resolveCfg = [&](const char* name) -> jobject {
+      jfieldID f = env->GetStaticFieldID(cfgLocal, name, "Landroid/graphics/Bitmap$Config;");
+      if (!f) { env->ExceptionClear(); return nullptr; }
+      jobject obj = env->GetStaticObjectField(cfgLocal, f);
+      if (!obj) return nullptr;
+      jobject g = env->NewGlobalRef(obj);
+      env->DeleteLocalRef(obj);
+      return g;
+    };
+    out.alpha8 = resolveCfg("ALPHA_8");
+    out.argb8888 = resolveCfg("ARGB_8888");
+    env->DeleteLocalRef(bmpLocal);
+    env->DeleteLocalRef(cfgLocal);
+    return out;
+  }();
+  if (!ids.bitmapCls || !ids.createBitmap3 || !ids.alpha8 || !ids.argb8888) return nullptr;
+
+  jobject bitmap = env->CallStaticObjectMethod(
+      ids.bitmapCls, ids.createBitmap3, gm.width, gm.height,
+      gm.singleChannel ? ids.alpha8 : ids.argb8888);
+  if (env->ExceptionCheck() || !bitmap) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  AndroidBitmapInfo info {};
+  void* dstPixels = nullptr;
+  if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+      AndroidBitmap_lockPixels(env, bitmap, &dstPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+      !dstPixels) {
+    return nullptr;
+  }
+  auto* dstBytes = static_cast<uint8_t*>(dstPixels);
+  const size_t rowBytes = static_cast<size_t>(gm.width) * (gm.singleChannel ? 1u : 4u);
+  if ((gm.singleChannel && info.format != ANDROID_BITMAP_FORMAT_A_8) ||
+      (!gm.singleChannel && info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) ||
+      gm.pixels.size() < rowBytes * static_cast<size_t>(gm.height)) {
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return nullptr;
+  }
+  for (int y = 0; y < gm.height; ++y) {
+    std::memcpy(dstBytes + static_cast<size_t>(y) * info.stride,
+                gm.pixels.data() + static_cast<size_t>(y) * rowBytes, rowBytes);
+  }
+  AndroidBitmap_unlockPixels(env, bitmap);
+
+  jfloat meta[] = {
+      gm.minContentBoost[0], gm.minContentBoost[1], gm.minContentBoost[2],
+      gm.maxContentBoost[0], gm.maxContentBoost[1], gm.maxContentBoost[2],
+      gm.gamma[0], gm.gamma[1], gm.gamma[2],
+      gm.offsetSdr[0], gm.offsetSdr[1], gm.offsetSdr[2],
+      gm.offsetHdr[0], gm.offsetHdr[1], gm.offsetHdr[2],
+      gm.hdrCapacityMin, gm.hdrCapacityMax, static_cast<jfloat>(gm.alternatePrimaries),
+  };
+  env->SetFloatArrayRegion(outMetadata, 0, sizeof(meta) / sizeof(meta[0]), meta);
+  return bitmap;
+#else
+  (void)env; (void)fd; (void)maxDim; (void)maxWorkingBytes; (void)outMetadata;
   return nullptr;
 #endif
 }

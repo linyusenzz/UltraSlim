@@ -468,6 +468,10 @@ class ConversionRepositoryTest {
         override suspend fun putBatch(batch: BatchEntity): Unit = error("Unused in queue tests")
         override suspend fun latestBatch(): BatchEntity? = error("Unused in queue tests")
         override suspend fun batch(id: String): BatchEntity? = error("Unused in queue tests")
+        override suspend fun isBatchCancelled(id: String): Boolean? = error("Unused in queue tests")
+        override suspend fun batchSettings(id: String): String? = error("Unused in queue tests")
         override suspend fun cancel(id: String): Unit = error("Unused in queue tests")
+        override suspend fun pruneUnreferencedBatches() = Unit
+        override suspend fun restorePublishedTaskOutputs() = Unit
     }
 }

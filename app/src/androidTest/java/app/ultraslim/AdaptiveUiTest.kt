@@ -21,6 +21,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.ultraslim.data.HistoryEntity
 import app.ultraslim.ui.adaptive.*
 import app.ultraslim.ui.theme.AppTheme
+import app.ultraslim.ui.components.PreviewCache
+import app.ultraslim.ui.components.UltraAsyncImage
+import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
 import app.ultraslim.data.ConversionDefaults
@@ -64,6 +67,33 @@ class AdaptiveUiTest {
             compose.onRoot().captureToImage().asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 100, it)
         }
     }
+    @androidx.test.filters.SdkSuppress(minSdkVersion = 34)
+    @Test fun nativePreviewReloadsWhenZoomOrHdrChanges() {
+        val sample = File.createTempFile("zoom-preview", ".jpg", app.cacheDir)
+        try {
+            instrumentation.context.assets.open("minnie-320x240-yuv-icc.jpg").use { input -> sample.outputStream().use { input.copyTo(it) } }
+            var dimension by mutableIntStateOf(128)
+            var hdr by mutableStateOf(false)
+            compose.runOnUiThread {
+                compose.activity.setContent {
+                    AppTheme {
+                        UltraAsyncImage(sample.path, "预览", ContentScale.Fit,
+                            modifier = Modifier.size(240.dp), maxDim = dimension, forceSdr = !hdr, enableHdr = hdr)
+                    }
+                }
+            }
+            compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("预览").fetchSemanticsNodes().isNotEmpty() }
+            compose.runOnIdle { dimension = 512 }
+            compose.waitUntil(10_000) { PreviewCache.peek(sample.path, 512) != null }
+            // Force the next HDR request to fail. Reusing the previous SDR bitmap would hide this failure.
+            assertTrue(sample.delete())
+            compose.runOnIdle { hdr = true }
+            compose.waitUntil(10_000) {
+                compose.onAllNodesWithText("图片不可访问", substring = true).fetchSemanticsNodes().isNotEmpty()
+            }
+        } finally { sample.delete() }
+    }
+
     @Test fun workspaceReflowsAndSettingsRemainReachable() {
         resize(420, 900)
         compose.onNodeWithTag("workspace-compact").assertExists()

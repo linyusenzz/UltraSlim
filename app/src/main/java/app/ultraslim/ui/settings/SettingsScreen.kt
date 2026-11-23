@@ -261,8 +261,11 @@ private fun OpenSourceNoticesDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
     val sections by produceState<List<String>?>(null) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching { context.assets.open("open-source-notices.txt").bufferedReader().use { it.readText() }.split("\n===== ") }
-                .getOrElse { listOf("无法读取开源声明，请重新安装完整安装包。") }
+            runCatching {
+                context.assets.open("open-source-notices.txt").bufferedReader().use { it.readText() }
+                    .split("\n===== ")
+                    .mapIndexed { index, part -> if (index == 0) part else "===== $part" }
+            }.getOrElse { listOf("无法读取开源声明，请重新安装完整安装包。") }
         }
     }
     AlertDialog(

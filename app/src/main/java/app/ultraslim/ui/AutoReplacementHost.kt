@@ -127,6 +127,12 @@ internal fun AutoReplacementHost(): ReplacementReview? {
                     AutoReplacement.finish(app, trashedAlready, "DONE", "原图已在系统回收站，无需再次确认")
                     AutoReplacement.finish(app, unavailable, "SKIPPED", "原图已删除或不可访问，不再请求替换")
                     if (toValidate.isNotEmpty()) {
+                        withContext(Dispatchers.IO) {
+                            pass.prefetchHistories(toValidate.map { it.historyId })
+                            pass.prefetchLocations(toValidate.flatMap {
+                                listOf(Uri.parse(it.sourceUri), Uri.parse(it.outputUri))
+                            })
+                        }
                         val permits = Semaphore(3)
                         for (group in toValidate.chunked(24)) {
                             if (cancelReview || !app.galleryPublishingAllowed.value || app.galleryPublicationRunning.value || app.conversionServiceRunning.value) return@collect

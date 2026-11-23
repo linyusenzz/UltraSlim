@@ -28,15 +28,23 @@ object ExportNames {
         return stem.substring(0, end) + tail
     }
 
+    fun normalizeKey(name: String): String =
+        Normalizer.normalize(name, Normalizer.Form.NFC).lowercase(Locale.ROOT)
+
     fun available(desired: String, occupied: Set<String>): String {
-        val used = occupied.mapTo(HashSet()) { Normalizer.normalize(it, Normalizer.Form.NFC).lowercase(Locale.ROOT) }
+        val used = occupied.mapTo(HashSet(occupied.size)) { normalizeKey(it) }
+        return availableNormalized(desired, used)
+    }
+
+    /** Avoids re-running ICU NFC normalization across all directory entries on every photo in a batch. */
+    fun availableNormalized(desired: String, normalizedUsed: Set<String>): String {
         val extension = desired.substringAfterLast('.', "")
         val stem = desired.substringBeforeLast('.', desired)
         val tail = if (extension.isEmpty()) "" else ".$extension"
         var index = 0
         while (true) {
             val candidate = fit(stem, (if (index == 0) "" else " ($index)") + tail)
-            if (candidate.lowercase(Locale.ROOT) !in used) return candidate
+            if (normalizeKey(candidate) !in normalizedUsed) return candidate
             index++
         }
     }

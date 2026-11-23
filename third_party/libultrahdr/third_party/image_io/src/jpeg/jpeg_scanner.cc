@@ -57,6 +57,12 @@ void JpegScanner::FindAndProcessSegments() {
     size_t payload_size = 0;
     JpegMarker marker(
         GetByte(begin_segment_location + JpegMarker::kTypeOffset));
+    if (marker.GetType() == JpegMarker::kFILL && !HasError()) {
+      // ITU-T T.81 B.1.1.2: any number of 0xFF fill bytes may precede a marker;
+      // advance by one byte so the second 0xFF can still start a valid marker.
+      current_location_ = begin_segment_location + 1;
+      continue;
+    }
     if (marker.IsValid() && !HasError()) {
       payload_size = GetPayloadSize(marker, begin_segment_location);
       if (marker.IsValid() && interesting_marker_flags_[marker.GetType()]) {

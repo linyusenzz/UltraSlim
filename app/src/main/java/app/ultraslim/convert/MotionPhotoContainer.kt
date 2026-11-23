@@ -16,7 +16,14 @@ import org.w3c.dom.Document
 import org.w3c.dom.Element
 
 /** Container operations shared by production and JVM regression tests. No Android dependencies. */
-data class MotionPhotoInfo(val presentationTimestampUs: Long, val videoLength: Long, val videoOffset: Long)
+data class MotionPhotoInfo(val presentationTimestampUs: Long, val videoLength: Long, val videoOffset: Long) {
+    /**
+     * End offset of the structurally complete still container preceding the motion video,
+     * or 0L if unknown. Excluded from data-class structural equality for test/protocol stability.
+     */
+    internal var stillEndOffset: Long = 0L
+    internal var sourceSizeBytes: Long = 0L
+}
 
 internal object MotionPhotoContainer {
     private const val CAMERA = "http://ns.google.com/photos/1.0/camera/"
@@ -95,7 +102,16 @@ internal object MotionPhotoContainer {
     fun detect(channel: FileChannel, containerXmp: String? = null): MotionPhotoInfo? {
         val size = channel.size()
         if (size < 8) return null
-        val jpeg = read(channel, 0, 2).contentEquals(byteArrayOf(-1, -40))
+        fun info(timestamp: Long, length: Long, offset: Long, stillEnd: Long = 0L) =
+            MotionPhotoInfo(timestamp, length, offset).apply {
+                stillEndOffset = stillEnd
+                sourceSizeBytes = size
+            }
+
+        val head = read(channel, 0, 2)
+        // Naked JPEG XL codestreams (0xFF 0x0A) cannot carry an ISO/JPEG Motion Photo trailer.
+        if (head[0] == (-1).toByte() && head[1] == 0x0a.toByte()) return null
+        val jpeg = head.contentEquals(byteArrayOf(-1, -40))
         val packet = if (jpeg) jpegXmp(channel) else containerXmp
         val doc = packet?.let { runCatching { xml(it) }.getOrNull() }
         val motion = doc?.let { property(it, "MotionPhoto") ?: property(it, "MicroVideo") }
@@ -117,11 +133,15 @@ internal object MotionPhotoContainer {
         if (oplusLength != null && oplusLength in 1 until size) {
             val regionStart = if (length != null && length in 1 until size) size - length else null
             for (start in listOfNotNull(regionStart, size - oplusLength).distinct()) {
-                if (validVideo(channel, start, oplusLength)) return MotionPhotoInfo(timestamp, oplusLength, start)
+                if (validVideo(channel, start, oplusLength)) {
+                    val stillEnd = if (jpeg) minOf(start, regionStart ?: start) else 0L
+                    return info(timestamp, oplusLength, start, stillEnd)
+                }
             }
         }
         if (length != null && length > 0 && length < size && validVideo(channel, size - length, length)) {
-            return MotionPhotoInfo(timestamp, length, size - length)
+            if (jpeg) return info(timestamp, length, size - length, size - length)
+            // For HEIF/AVIF, walk top-level boxes below so we also determine exact stillEndOffset.
         }
         if (!jpeg) {
             var pos = 0L
@@ -136,14 +156,16 @@ internal object MotionPhotoContainer {
                 if (b.type == "mpvd" && pos + b.size == size) {
                     val offset = pos + b.header
                     if (validVideo(channel, offset, b.size - b.header))
-                        return MotionPhotoInfo(timestamp, b.size - b.header, offset)
+                        return info(timestamp, b.size - b.header, offset, stillEnd = pos)
                 }
                 if (b.type == "ftyp" && pos > 0) appendedFtyp = pos
                 pos += b.size
             }
             // A second top-level ftyp is an MP4 appended after the image container.
             if (appendedFtyp >= 0 && validVideo(channel, appendedFtyp, size - appendedFtyp))
-                return MotionPhotoInfo(timestamp, size - appendedFtyp, appendedFtyp)
+                return info(timestamp, size - appendedFtyp, appendedFtyp, stillEnd = if (boxesReachEof) appendedFtyp else 0L)
+            if (length != null && length > 0 && length < size && validVideo(channel, size - length, length))
+                return info(timestamp, length, size - length)
             if (boxesReachEof && motion != "1") return null
         } else if (motion == null && read(channel, size - 2, 2).contentEquals(byteArrayOf(-1, -39))) {
             // A still JPEG that ends at EOI has nothing appended after the image.
@@ -152,16 +174,25 @@ internal object MotionPhotoContainer {
         // Vendor motion photos may carry no Google XMP, or offsets that point at a proprietary
         // envelope; scan for a structurally complete MP4 ending at EOF regardless of XMP claims.
         // Overlap seven bytes so a split size+ftyp header cannot be missed.
+        // Reuse one 64 KiB buffer instead of allocating up to 480 arrays (30 MiB) on trailer JPEGs.
         val start = maxOf(0, size - 30L * 1024 * 1024)
         var end = size
+        val scanBuf = ByteBuffer.allocate(65536)
+        val bytes = scanBuf.array()
         while (end > start) {
             val begin = maxOf(start, end - 65536)
-            val bytes = read(channel, begin, (end - begin).toInt())
-            for (i in bytes.size - 8 downTo 0) {
+            val chunkLen = (end - begin).toInt()
+            scanBuf.clear()
+            scanBuf.limit(chunkLen)
+            while (scanBuf.hasRemaining()) {
+                if (channel.read(scanBuf, begin + scanBuf.position()) <= 0) throw EOFException("文件读取不完整")
+            }
+            for (i in chunkLen - 8 downTo 0) {
                 if (bytes[i + 4] == 102.toByte() && bytes[i + 5] == 116.toByte() &&
                     bytes[i + 6] == 121.toByte() && bytes[i + 7] == 112.toByte()) {
                     val offset = begin + i
-                    if (validVideo(channel, offset, size - offset)) return MotionPhotoInfo(timestamp, size - offset, offset)
+                    if (validVideo(channel, offset, size - offset))
+                        return info(timestamp, size - offset, offset, stillEnd = if (jpeg) offset else 0L)
                 }
             }
             if (begin == start) break
@@ -190,14 +221,24 @@ internal object MotionPhotoContainer {
         s.end - s.start >= 4 + xmpHeader.size && xmpHeader.indices.all { bytes[s.start + 4 + it] == xmpHeader[it] }
 
     private fun jpegXmp(channel: FileChannel): String? {
+        val fileSize = channel.size()
+        val hdrBuf = ByteBuffer.allocate(4)
+        val h = hdrBuf.array()
         var pos = 2L
-        while (pos + 4 <= channel.size()) {
-            val h = read(channel, pos, 4)
+        while (pos + 4 <= fileSize) {
+            hdrBuf.clear()
+            while (hdrBuf.hasRemaining()) {
+                if (channel.read(hdrBuf, pos + hdrBuf.position()) <= 0) return null
+            }
             if (h[0] != (-1).toByte()) return null
-            val marker = h[1].toInt() and 255
+            var marker = h[1].toInt() and 255
+            if (marker == 0xff) {
+                pos += 1
+                continue
+            }
             if (marker == 0xda || marker == 0xd9) return null
             val length = ((h[2].toInt() and 255) shl 8) or (h[3].toInt() and 255)
-            if (length < 2 || pos + 2 + length > channel.size()) return null
+            if (length < 2 || pos + 2 + length > fileSize) return null
             if (marker == 0xe1) {
                 val data = read(channel, pos + 4, length - 2)
                 if (data.size >= xmpHeader.size && xmpHeader.indices.all { data[it] == xmpHeader[it] })
@@ -302,9 +343,19 @@ internal object MotionPhotoContainer {
 
     fun copyVideo(channel: FileChannel, info: MotionPhotoInfo, output: OutputStream) {
         require(validVideo(channel, info.videoOffset, info.videoLength)) { "实况视频不完整" }
-        val buffer = ByteBuffer.allocate(128 * 1024)
         var offset = info.videoOffset
         var remaining = info.videoLength
+        if (output is java.io.FileOutputStream) {
+            val dst = output.channel
+            while (remaining > 0) {
+                val transferred = channel.transferTo(offset, remaining, dst)
+                if (transferred <= 0) break
+                offset += transferred
+                remaining -= transferred
+            }
+            if (remaining == 0L) return
+        }
+        val buffer = ByteBuffer.allocate(128 * 1024)
         while (remaining > 0) {
             buffer.clear()
             buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())

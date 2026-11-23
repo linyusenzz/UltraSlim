@@ -27,7 +27,19 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
             }
         }.getOrNull()
 
-        fun timestamps(context: Context, source: Uri): SourceTimestamps {
+        private fun fstatMillis(fd: java.io.FileDescriptor): Long? = runCatching {
+            val stat = android.system.Os.fstat(fd)
+            if (!android.system.OsConstants.S_ISREG(stat.st_mode)) return@runCatching null
+            val seconds = stat.st_mtime.takeIf { value -> value > 0 && value <= Long.MAX_VALUE / 1000 } ?: return@runCatching null
+            seconds * 1000 + stat.st_mtim.tv_nsec / 1_000_000
+        }.getOrNull()
+
+        fun timestamps(
+            context: Context,
+            source: Uri,
+            hasExif: Boolean = true,
+            descriptor: java.io.FileDescriptor? = null,
+        ): SourceTimestamps {
             InputMetadataStore.read(context, source)?.let { return it }
             val canonical = MediaStoreTrashHelper.resolveToMediaStoreImageUri(context, source)
             var taken: Long? = null
@@ -56,20 +68,26 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
                 taken = queryTime(context, source, MediaStore.Images.Media.DATE_TAKEN)
                 modified = queryTime(context, source, android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED)
             }
-            if (taken == null) taken = exifCaptureTime(context, source)
-            val descriptorTime = runCatching {
-                context.contentResolver.openFileDescriptor(source, "r")?.use {
-                    val stat = android.system.Os.fstat(it.fileDescriptor)
-                    if (!android.system.OsConstants.S_ISREG(stat.st_mode)) return@use null
-                    val seconds = stat.st_mtime.takeIf { value -> value > 0 && value <= Long.MAX_VALUE / 1000 } ?: return@use null
-                    seconds * 1000 + stat.st_mtim.tv_nsec / 1_000_000
-                }
+            if (taken == null && hasExif) taken = exifCaptureTime(context, source)
+            val descriptorTime = if (descriptor != null) fstatMillis(descriptor) else runCatching {
+                context.contentResolver.openFileDescriptor(source, "r")?.use { fstatMillis(it.fileDescriptor) }
             }.getOrNull()
-            // Cloud providers may return a temporary download fd; their indexed date wins.
-            val local = source.authority == "media" || source.authority == "com.android.externalstorage.documents"
+            // Cloud providers (including Photo Picker cloud items under content://media/picker/...)
+            // may return a temporary download fd; their indexed date wins.
+            val local = (source.authority == MediaStore.AUTHORITY && source.pathSegments.firstOrNull() != "picker") ||
+                source.authority == "com.android.externalstorage.documents"
             val fileTime = if (local) descriptorTime ?: modified else modified ?: descriptorTime
             // DATE_ADDED and file modification time are not capture time.
             return SourceTimestamps(taken, fileTime)
+        }
+
+        private fun parseRow(volume: String?, path: String?, rawTaken: Long, rawModified: Long, fallbackDate: () -> Long?): SourceMedia? {
+            if (volume == null || path == null) return null
+            if (volume in setOf("external", "internal") || path.isBlank() || path.startsWith('/') ||
+                path.split('/').any { it == ".." || it == "." }) return null
+            val date = rawTaken.takeIf { it > 0 } ?: fallbackDate()
+            val modified = rawModified.takeIf { it > 0 && it <= Long.MAX_VALUE / 1000 }?.times(1000)
+            return SourceMedia(volume, path.trimEnd('/') + "/", date, modified)
         }
 
         fun read(context: Context, source: Uri): SourceMedia? {
@@ -79,15 +97,52 @@ internal data class SourceMedia(val volume: String, val relativePath: String, va
                     MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.Images.Media.DATE_TAKEN,
                     MediaStore.MediaColumns.DATE_MODIFIED), null, null, null)?.use { c ->
                     if (!c.moveToFirst()) return@use null
-                    val volume = c.getString(0) ?: return@use null
-                    val path = c.getString(1) ?: return@use null
-                    if (volume in setOf("external", "internal") || path.isBlank() || path.startsWith('/') ||
-                        path.split('/').any { it == ".." || it == "." }) return@use null
-                    val date = c.getLong(2).takeIf { it > 0 } ?: exifCaptureTime(context, source)
-                    val modified = c.getLong(3).takeIf { it > 0 && it <= Long.MAX_VALUE / 1000 }?.times(1000)
-                    SourceMedia(volume, path.trimEnd('/') + "/", date, modified)
+                    parseRow(c.getString(0), c.getString(1), c.getLong(2), c.getLong(3)) {
+                        exifCaptureTime(context, source)
+                    }
                 }
             }.getOrNull()
+        }
+
+        /** Batch-query volume and relativePath by _ID IN (...) to avoid 2N IPCs in AutoReplacement.validate. */
+        fun readBatch(context: Context, sources: Collection<Uri>, includeExifFallback: Boolean = false): Map<Uri, SourceMedia> {
+            if (sources.isEmpty()) return emptyMap()
+            val out = HashMap<Uri, SourceMedia>(sources.size)
+            val byCollection = HashMap<Uri, MutableMap<Long, MutableList<Uri>>>()
+            sources.forEach { source ->
+                val target = MediaStoreTrashHelper.resolveToMediaStoreImageUri(context, source)
+                val segs = target?.pathSegments
+                val id = segs?.lastOrNull()?.toLongOrNull()
+                if (target == null || segs == null || id == null || segs.size < 2) return@forEach
+                val collection = Uri.Builder().scheme(target.scheme).authority(target.authority)
+                    .path(segs.dropLast(1).joinToString("/")).build()
+                byCollection.getOrPut(collection) { HashMap() }.getOrPut(id) { mutableListOf() } += source
+            }
+            byCollection.forEach { (collection, ids) ->
+                ids.keys.chunked(500).forEach { chunk ->
+                    runCatching {
+                        context.contentResolver.query(
+                            collection,
+                            arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.VOLUME_NAME,
+                                MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.Images.Media.DATE_TAKEN,
+                                MediaStore.MediaColumns.DATE_MODIFIED),
+                            "${MediaStore.MediaColumns._ID} IN (${chunk.joinToString(",") { "?" }})",
+                            chunk.map { it.toString() }.toTypedArray(),
+                            null,
+                        )?.use { c ->
+                            while (c.moveToNext()) {
+                                val id = c.getLong(0)
+                                val callers = ids[id] ?: continue
+                                val media = parseRow(c.getString(1), c.getString(2), c.getLong(3), c.getLong(4)) {
+                                    if (includeExifFallback) callers.firstOrNull()?.let { exifCaptureTime(context, it) } else null
+                                } ?: continue
+                                callers.forEach { out[it] = media }
+                            }
+                        }
+                    }
+                }
+            }
+            return out
         }
     }
 }

@@ -7,10 +7,14 @@ import java.io.IOException
 
 /** Catch platform HDR decode failures before publishing a compatible HEIC/AVIF. */
 internal object HdrOutputValidation {
-    fun requireReadableGainmap(file: File): Boolean {
+    fun requireReadableGainmap(file: File, expectedWidth: Int = 0, expectedHeight: Int = 0): Boolean {
         if (Build.VERSION.SDK_INT < 34) return false // Gainmap API is unavailable.
         val bitmap = try {
             ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                if (expectedWidth > 0 && expectedHeight > 0) {
+                    check((info.size.width == expectedWidth && info.size.height == expectedHeight) ||
+                        (info.size.width == expectedHeight && info.size.height == expectedWidth)) { "系统解码尺寸不一致" }
+                }
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 // Never use MEMORY_POLICY_LOW_RAM here: Android 14+ drops the Gainmap under LOW_RAM.
                 val edge = maxOf(info.size.width, info.size.height)

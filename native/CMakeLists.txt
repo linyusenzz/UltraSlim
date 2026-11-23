@@ -93,6 +93,9 @@ else()
   target_compile_options(ultraslim PRIVATE
       -fvisibility=hidden -fvisibility-inlines-hidden
       -ffunction-sections -fdata-sections)
+  # Android JNI always preserves the source gain map; keep HDR rebuild only in host tests
+  # so --gc-sections + ThinLTO can strip unused libultrahdr tonemap/decode object code.
+  target_compile_definitions(ultraslim PRIVATE ULTRASLIM_ENABLE_REBUILD=0)
   target_link_options(ultraslim PRIVATE
       "-Wl,-z,max-page-size=16384"
       "-Wl,-z,common-page-size=16384"

@@ -28,6 +28,12 @@ class ExportNamesTest {
     @Test fun collisionsIncludeCaseAndUnicodeEquivalence() {
         assertEquals("é (2).heic", ExportNames.available("é.heic", setOf("e\u0301.HEIC", "É (1).heic")))
         assertEquals("a_b (1).heic", ExportNames.available(ExportNames.fromSource("a:b.jpg", "heic"), setOf("a_b.heic")))
+        val rawUsed = setOf("e\u0301.HEIC", "É (1).heic", "photo.avif")
+        val normalizedUsed = rawUsed.mapTo(HashSet()) { ExportNames.normalizeKey(it) }
+        assertEquals(
+            ExportNames.available("é.heic", rawUsed),
+            ExportNames.availableNormalized("é.heic", normalizedUsed),
+        )
     }
 
 }

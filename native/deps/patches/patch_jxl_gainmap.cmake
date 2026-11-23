@@ -1,0 +1,21 @@
+# libjxl 0.11.1 installs the jhgm/ICC API headers but builds these implementations
+# only in the tools extras. Include them in our static libjxl without enabling tools.
+set(source "${SRC_DIR}/lib/jxl_lists.cmake")
+file(READ "${source}" original)
+set(anchor "set(JPEGXL_INTERNAL_ENC_SOURCES\n")
+set(patched_anchor "${anchor}  extras/compressed_icc.cc\n  extras/gain_map.cc\n")
+string(FIND "${original}" "${patched_anchor}" already_patched)
+if(NOT already_patched EQUAL -1)
+  return()
+endif()
+
+string(FIND "${original}" "${anchor}" encoder_list)
+string(FIND "${original}" "  extras/compressed_icc.cc\n" icc_source)
+string(FIND "${original}" "  extras/gain_map.cc\n" gainmap_source)
+if(encoder_list EQUAL -1 OR icc_source EQUAL -1 OR gainmap_source EQUAL -1)
+  message(FATAL_ERROR "Pinned libjxl source lists changed")
+endif()
+string(REPLACE "  extras/compressed_icc.cc\n" "" updated "${original}")
+string(REPLACE "  extras/gain_map.cc\n" "" updated "${updated}")
+string(REPLACE "${anchor}" "${patched_anchor}" updated "${updated}")
+file(WRITE "${source}" "${updated}")

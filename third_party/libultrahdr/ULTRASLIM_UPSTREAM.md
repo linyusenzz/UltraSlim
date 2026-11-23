@@ -122,3 +122,12 @@ been validated locally. These backports are not a completed release validation.
 Apple-only map normalization/export remains under investigation and is not
 enabled. Correct headroom parsing alone does not establish equivalent Apple
 and ISO HDR rendering. See [audit and validation limits](../../docs/reports/2026-11-07-libultrahdr-backports.md).
+
+## JPEG fill-byte scanner fix (2026-11-23)
+
+`third_party/image_io/src/jpeg/jpeg_scanner.cc` now advances `current_location_`
+by 1 byte instead of `JpegMarker::kLength` (2 bytes) when encountering a `0xFF`
+fill byte (`JpegMarker::kFILL`). Previously, an even run of leading `0xFF` bytes
+(such as `0xFF 0xFF 0xE1` per ITU-T T.81 Section B.1.1.2) stepped past the final
+`0xFF` marker prefix and skipped the segment during header scanning and
+`jxlJpegReconstruction` metadata scrubbing.

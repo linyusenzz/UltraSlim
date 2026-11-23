@@ -59,6 +59,7 @@ import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -500,7 +501,7 @@ fun ConversionOptionsPanel(
             ExpressiveChoiceRow(formats.map { it.label }, formats.indexOf(defaults.format),
                 onSelect = { callbacks.onFormatChange(formats[it]) }, enabled = enabled)
             val formatTip = when (defaults.format) {
-                OutputFormat.AVIF -> "AVIF：现代 AV1 编码，体积超小；实况照片将导出为静止 HDR"
+                OutputFormat.AVIF -> "AVIF：现代 AV1 编码，体积超小，支持保留实况照片；HDR 显示取决于相册支持"
                 OutputFormat.HEIC -> "HEIC：高效 HEVC 编码，支持保留实况照片；HDR 显示取决于相册支持"
                 OutputFormat.JXL -> "JXL：JPEG XL 现代格式，保留极致微观纹理与无损级色彩"
                 OutputFormat.JPEG -> "JPEG：经典通用格式，最大兼容性，体积缩减相对有限"
@@ -759,6 +760,8 @@ fun rememberThumbMaxDim(): Int {
  * [maxDim] is the long edge requested from that fallback. List rows should pass
  * [rememberThumbMaxDim]; detail keeps the default.
  */
+private val failedPlatformPreviewUris = android.util.LruCache<String, Boolean>(256)
+
 @Composable
 fun UltraAsyncImage(
     uriString: String,
@@ -767,31 +770,56 @@ fun UltraAsyncImage(
     modifier: Modifier = Modifier,
     maxDim: Int = 1280,
     forceSdr: Boolean = false,
+    preferNative: Boolean = false,
+    enableHdr: Boolean = false,
 ) {
     val context = LocalContext.current
-    var useNative by remember(uriString, forceSdr) {
-        mutableStateOf(forceSdr || uriString.endsWith(".jxl", ignoreCase = true))
+    val requestHdr = enableHdr && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+    var useNative by remember(uriString, forceSdr, preferNative, requestHdr) {
+        mutableStateOf(
+            requestHdr || forceSdr || preferNative ||
+                uriString.endsWith(".jxl", ignoreCase = true) ||
+                failedPlatformPreviewUris.get(uriString) == true
+        )
     }
     if (!useNative) {
-        AsyncImage(
-            model = ImageRequest.Builder(context)
+        val request = remember(context, uriString) {
+            ImageRequest.Builder(context)
                 .data(imageModelOf(uriString))
                 .crossfade(Motion.Fast)
-                .build(),
+                .build()
+        }
+        AsyncImage(
+            model = request,
             contentDescription = contentDescription,
             contentScale = contentScale,
             modifier = modifier,
-            onError = { useNative = true },
+            onError = {
+                failedPlatformPreviewUris.put(uriString, true)
+                useNative = true
+            },
         )
     } else {
-        val result = produceState<NativeImage?>(null, uriString, maxDim) {
-            value = withContext(Dispatchers.IO) { NativeImage(PreviewCache.load(context, uriString, maxDim), true) }
-        }.value
-        // 上一代解码结果跨 maxDim 保留：放大触发高分辨率重解码时旧图仍在屏，
+        val immediate = remember(uriString, maxDim, requestHdr) {
+            if (requestHdr) null else PreviewCache.peek(uriString, maxDim)
+        }
+        val result = key(uriString, maxDim, requestHdr) {
+            produceState<NativeImage?>(immediate?.let { NativeImage(it, true) }) {
+                value = withContext(Dispatchers.IO) {
+                    val bmp = if (requestHdr && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        PreviewCache.loadHdr(context, uriString, maxDim)
+                    } else {
+                        PreviewCache.load(context, uriString, maxDim)
+                    }
+                    NativeImage(bmp, true)
+                }
+            }.value
+        }
+        // 上一代解码结果跨 maxDim/HDR 切换保留：放大或切 HDR 触发重解码时旧图仍在屏，
         // 不闪回转圈；只有首屏无图才显示 spinner。
-        var lastBitmap by remember(uriString) { mutableStateOf<Bitmap?>(null) }
+        var lastBitmap by remember(uriString) { mutableStateOf<Bitmap?>(immediate) }
         if (result?.bitmap != null) lastBitmap = result.bitmap
-        val shown = result?.bitmap ?: lastBitmap
+        val shown = if (result?.finished == true) result.bitmap else lastBitmap
         val state = when {
             shown != null -> NativeDecoded.Ready(shown)
             result?.finished == true -> NativeDecoded.Failed

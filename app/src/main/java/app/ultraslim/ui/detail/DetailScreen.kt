@@ -360,6 +360,25 @@ private fun DetailContent(
     modifier: Modifier = Modifier,
 ) {
     val saved = entity.outputUri.startsWith("content://")
+    val supportsHdrPreview = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        entity.hadGainMap
+    var hdrPreview by androidx.compose.runtime.saveable.rememberSaveable(entity.id) { mutableStateOf(false) }
+    val context = LocalContext.current
+    if (supportsHdrPreview) {
+        androidx.compose.runtime.DisposableEffect(context, hdrPreview) {
+            val window = (context as? android.app.Activity)?.window
+            val previousMode = window?.colorMode
+            if (window != null) {
+                window.colorMode = if (hdrPreview) android.content.pm.ActivityInfo.COLOR_MODE_HDR
+                    else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+            }
+            onDispose {
+                if (window != null && previousMode != null) {
+                    window.colorMode = previousMode
+                }
+            }
+        }
+    }
 
     val overview: @Composable () -> Unit = {
         Card(
@@ -476,8 +495,21 @@ private fun DetailContent(
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 if (!expanded) overview()
         SectionHeader("画质细节对比", "拖动分界线查看对比；双击 2.5× 放大；双指可捏合缩放")
-        Text("当前页面为 SDR 预览；完整 HDR 高动态亮度请在系统相册中查看。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        HeroCompareCard(entity = entity)
+        Text(
+            when {
+                supportsHdrPreview && hdrPreview -> "已开启 HDR 预览。无法正确应用增益图的照片会显示 SDR。"
+                supportsHdrPreview -> "当前为 SDR 预览；可点按下方「HDR 高光」或在系统相册中查看高动态亮度。"
+                else -> "当前页面为 SDR 预览；完整 HDR 高动态亮度请在系统相册中查看。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        HeroCompareCard(
+            entity = entity,
+            supportsHdrPreview = supportsHdrPreview,
+            hdrPreview = supportsHdrPreview && hdrPreview,
+            onToggleHdrPreview = { hdrPreview = !hdrPreview },
+        )
 
 
                 if (!expanded) metadata()
@@ -495,7 +527,13 @@ private fun DetailContent(
 }
 
 @Composable
-private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier) {
+private fun HeroCompareCard(
+    entity: HistoryEntity,
+    modifier: Modifier = Modifier,
+    supportsHdrPreview: Boolean = false,
+    hdrPreview: Boolean = false,
+    onToggleHdrPreview: () -> Unit = {},
+) {
     var compareMode by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) } // 0: 卷帘, 1: 按住
     var isHoldingOriginal by remember { mutableStateOf(false) }
     val sliderState = rememberSliderState(value = 0.5f)
@@ -597,9 +635,10 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
             // 压缩后（右侧/底层）
             UltraAsyncImage(
                 uriString = entity.outputUri,
-                contentDescription = "压缩后 SDR",
+                contentDescription = if (hdrPreview) "压缩后 HDR" else "压缩后 SDR",
                 contentScale = ContentScale.Fit,
-                forceSdr = true,
+                forceSdr = !hdrPreview,
+                enableHdr = hdrPreview,
                 maxDim = if(highResZoom) 2048 else 1600,
                 modifier = Modifier.fillMaxSize(),
             )
@@ -608,9 +647,10 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
             val outputLong = maxOf(entity.width, entity.height)
             UltraAsyncImage(
                 uriString = entity.inputUri,
-                contentDescription = "原图 SDR",
+                contentDescription = if (hdrPreview) "原图 HDR" else "原图 SDR",
                 contentScale = ContentScale.Fit,
-                forceSdr = true,
+                forceSdr = !hdrPreview,
+                enableHdr = hdrPreview,
                 maxDim = if(highResZoom) 2048 else if(outputLong in 1 until 1600) outputLong else 1600,
                 modifier = Modifier.fillMaxSize().drawWithContent {
                     val effectiveFraction = if (compareMode == 1) {
@@ -681,6 +721,13 @@ private fun HeroCompareCard(entity: HistoryEntity, modifier: Modifier = Modifier
                     onClick = { compareMode = 1 },
                     label = { Text("按住对比") },
                 )
+                if (supportsHdrPreview) {
+                    FilterChip(
+                        selected = hdrPreview,
+                        onClick = onToggleHdrPreview,
+                        label = { Text("HDR 高光") },
+                    )
+                }
             }
             if (zoomedIn) {
                 AssistChip(

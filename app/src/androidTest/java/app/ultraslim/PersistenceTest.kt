@@ -139,6 +139,30 @@ class PersistenceTest {
         } finally { scope.cancel(); db.close() }
     }
 
+    @Test fun startupRestoresPublishedOutputsAndPrunesOnlyOrphanBatches() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val tasks = db.taskDao()
+            for (id in listOf("referenced", "orphan")) tasks.putBatch(BatchEntity(id, "[]", "{}"))
+            val item = QueueItem("done", "content://source", "photo.jpg", 100, status = QueueStatus.DONE,
+                outputUri = "/old/private.heic", error = "待保存", batchId = "referenced")
+            tasks.put(listOf(item))
+            val published = "content://media/external/images/media/99"
+            db.historyDao().insert(HistoryEntity(displayName = "photo.heic", inputUri = item.uri,
+                outputUri = published, inputBytes = 100, outputBytes = 40, width = 4, height = 4,
+                gainmapWidth = 0, gainmapHeight = 0, hadGainMap = false, format = "HEIC", inputFormat = "JPEG",
+                durationMs = 1.0, maxContentBoost = 1f, createdAt = 1, status = "DONE", taskId = item.id))
+            val repo = ConversionRepository(tasks, scope)
+            repo.awaitReady()
+            assertEquals(item.copy(outputUri = published, error = null), repo.find(item.id))
+            assertEquals(repo.queue.value, tasks.all())
+            assertNotNull(tasks.batch("referenced"))
+            assertNull(tasks.batch("orphan"))
+        } finally { scope.cancel(); db.close() }
+    }
+
     @Test fun durableQueueAndCancellation() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context,AppDatabase::class.java).build()

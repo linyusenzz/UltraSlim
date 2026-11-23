@@ -21,14 +21,19 @@ import app.ultraslim.ui.theme.AppTheme
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        installSplashScreen()
+        val splash = installSplashScreen()
+        val splashStarted = android.os.SystemClock.uptimeMillis()
+        splash.setKeepOnScreenCondition {
+            (application as UltraSlimApp).initialTheme.value == null &&
+                android.os.SystemClock.uptimeMillis() - splashStarted < 80L
+        }
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         if (savedInstanceState == null) forwardShareIntent(intent)
         setContent {
             val app = application as UltraSlimApp
             val themeSettings by app.settingsRepository.theme
-                .collectAsStateWithLifecycle(initialValue = ThemeSettings())
+                .collectAsStateWithLifecycle(initialValue = app.initialTheme.value ?: ThemeSettings())
             AppTheme(themeMode = themeSettings.themeMode, dynamicColor = themeSettings.dynamicColor) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),

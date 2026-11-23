@@ -85,12 +85,21 @@ class ConversionService : Service() {
                                     ConversionThermalPolicy.retryDelaySeconds(attempt) * 1000L)
                                 var nextThermalCheck = SystemClock.elapsedRealtime() +
                                     ConversionThermalPolicy.CHECK_INTERVAL_SECONDS * 1000L
+                                var lastNotificationMessage: String? = null
+                                var lastNotificationAt = 0L
                                 while (SystemClock.elapsedRealtime() < retryAt) {
-                                    val remaining = ((deadline - SystemClock.elapsedRealtime() + 999) / 1000).toInt().coerceAtLeast(0)
+                                    val now = SystemClock.elapsedRealtime()
+                                    val remaining = ((deadline - now + 999) / 1000).toInt().coerceAtLeast(0)
                                     app.conversionThermalState.value?.let { state ->
                                         val updated = state.copy(remainingSeconds = remaining)
                                         app.conversionThermalState.value = updated
-                                        promote(runner.createForegroundInfo(0, "等待系统解除热限制", updated.message, false))
+                                        if (lastNotificationMessage != updated.message &&
+                                            (lastNotificationAt == 0L || now - lastNotificationAt >= 5000L || remaining == 0)
+                                        ) {
+                                            promote(runner.createForegroundInfo(0, "等待系统解除热限制", updated.message, false))
+                                            lastNotificationMessage = updated.message
+                                            lastNotificationAt = now
+                                        }
                                     }
                                     delay(1000)
                                     // Pending rows can be removed while cooling. Do not leave an
@@ -100,7 +109,7 @@ class ConversionService : Service() {
                                         app.conversionThermalState.value = null
                                         return@withLock
                                     }
-                                    if (app.database.taskDao().batch(id)?.cancelled != false) {
+                                    if (app.database.taskDao().isBatchCancelled(id) != false) {
                                         val pendingIds = batchItems.map { it.id }
                                         app.conversionRepository.updateAll(pendingIds) {
                                             if (it.status == QueueStatus.READY && it.error?.contains("等待降温") == true)

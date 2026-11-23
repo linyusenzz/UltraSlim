@@ -42,6 +42,10 @@ internal object InputMetadataStore {
         }.getOrNull()
     }
 
+    fun delete(context: Context, id: String) {
+        AtomicFile(file(context, id)).delete()
+    }
+
     fun cleanUnreferenced(context: Context, referenced: Set<String>, cutoff: Long) {
         directory(context).listFiles()?.forEach { metadata ->
             val id = metadata.name.removeSuffix(".bak").removeSuffix(".new").removeSuffix(".json")

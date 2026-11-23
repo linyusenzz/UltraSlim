@@ -223,6 +223,8 @@ ExternalProject_Add(libjxl
     GIT_TAG ${ULTRASLIM_LIBJXL_TAG}
     GIT_SHALLOW TRUE
     GIT_SUBMODULES "third_party/brotli" "third_party/highway" "third_party/skcms"
+    PATCH_COMMAND ${CMAKE_COMMAND} -DSRC_DIR=<SOURCE_DIR>
+                  -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/patch_jxl_gainmap.cmake
     CMAKE_ARGS ${COMMON_CMAKE_ARGS}
                -DBUILD_TESTING=OFF
                -DJPEGXL_ENABLE_TOOLS=OFF
@@ -243,4 +245,6 @@ ExternalProject_Add_Step(libjxl verify_pin
     COMMAND ${CMAKE_COMMAND} -DSRC_DIR=<SOURCE_DIR> -DEXPECTED=${ULTRASLIM_LIBJXL_COMMIT}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/verify_git_pin.cmake
     COMMENT "Verifying libjxl resolves to the pinned commit"
-    DEPENDEES update DEPENDERS patch ALWAYS TRUE)
+    DEPENDEES update DEPENDERS patch ALWAYS TRUE INDEPENDENT TRUE)
+ExternalProject_Add_StepDependencies(libjxl patch
+    ${CMAKE_CURRENT_SOURCE_DIR}/patches/patch_jxl_gainmap.cmake)

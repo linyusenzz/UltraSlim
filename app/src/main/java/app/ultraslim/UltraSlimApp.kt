@@ -12,18 +12,33 @@ import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
+import app.ultraslim.convert.InputStore
 
-class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
+class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory, androidx.work.Configuration.Provider {
+
+    override val workManagerConfiguration: androidx.work.Configuration
+        get() = androidx.work.Configuration.Builder()
+            .setMinimumLoggingLevel(android.util.Log.INFO)
+            .build()
 
     override fun newImageLoader(context: coil3.PlatformContext): coil3.ImageLoader =
         coil3.ImageLoader.Builder(context)
             .memoryCache {
                 coil3.memory.MemoryCache.Builder()
-                    .maxSizeBytes(20 * 1024 * 1024)
+                    // PreviewCache owns the primary 12 MiB thumb + 34 MiB detail pools;
+                    // keep Coil's platform-decode cache modest to avoid duplicate residency.
+                    .maxSizeBytes(8 * 1024 * 1024)
                     .build()
             }
             .build()
+
+    // Pre-warmed on IO during Application.onCreate so MainActivity renders Frame 1 in the saved theme.
+    internal val initialTheme = kotlinx.coroutines.flow.MutableStateFlow<app.ultraslim.data.ThemeSettings?>(null)
 
     // Shared with legacy workers to prevent overlapping native encoders during an upgrade.
     internal val conversionMutex = kotlinx.coroutines.sync.Mutex()
@@ -37,13 +52,20 @@ class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    internal val conversionRunning by lazy {
+    private val conversionActivity by lazy {
         kotlinx.coroutines.flow.combine(conversionServiceRunning,
             androidx.work.WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkFlow(ConversionWorker.UNIQUE_WORK_NAME)) { service, infos ->
             service || infos.any { !it.state.isFinished }
         }
     }
+
+    internal val conversionRunning by lazy {
+        conversionActivity.shareIn(appScope, SharingStarted.WhileSubscribed(5000), replay = 1)
+    }
+
+    // One-shot guards must query current work instead of accepting the UI's replayed value.
+    internal suspend fun isConversionRunning() = conversionActivity.first()
 
     val historyRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         app.ultraslim.data.HistoryRepository(database, appScope)
@@ -67,6 +89,9 @@ class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
         super.onCreate()
         app.ultraslim.convert.ImageWork.initialize(filesDir)
         createNotificationChannel()
+        appScope.launch {
+            settingsRepository.theme.collect { initialTheme.value = it }
+        }
         appScope.launch {
             // A process death while the system dialog was open must not re-prompt indefinitely.
             database.replacementDao().interruptRequests()
@@ -104,16 +129,20 @@ class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
                 conversionRepository.queue.value.forEach { add(it.uri); it.outputUri?.let(::add) }
             }
             val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+            val recentTempCutoff = System.currentTimeMillis() - 60L * 60 * 1000
             listOf("inputs", "outputs").forEach { folder ->
                 File(filesDir, folder).listFiles()?.forEach { file ->
-                    if (file.lastModified() < cutoff && file.path !in referenced) {
+                    if (file.name.endsWith(".motion.tmp") && file.lastModified() < recentTempCutoff) {
+                        file.delete()
+                    } else if (file.lastModified() < cutoff && file.path !in referenced) {
                         val uri = androidx.core.content.FileProvider.getUriForFile(this@UltraSlimApp, "$packageName.files", file).toString()
                         if (uri !in referenced) file.delete()
                     }
                 }
             }
             app.ultraslim.convert.InputMetadataStore.cleanUnreferenced(this@UltraSlimApp, referenced, cutoff)
-            cleanStaleOutputs()
+            InputStore.referenceLock.withLock { InputStore.pruneAppGrants(this@UltraSlimApp) }
+            app.ultraslim.ui.components.PreviewCache.cleanStartup(this@UltraSlimApp)
         }
     }
 
@@ -136,19 +165,5 @@ class UltraSlimApp : Application(), coil3.SingletonImageLoader.Factory {
             description = getString(R.string.channel_conversion_desc)
         }
         getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
-    }
-
-    /** Drops leftover transcode outputs and URI batches older than a day. */
-    private fun cleanStaleOutputs() {
-        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
-        for (name in listOf("previews")) {
-            runCatching {
-                val dir = File(cacheDir, name)
-                if (!dir.isDirectory) return@runCatching
-                dir.listFiles()?.forEach { file ->
-                    if (file.lastModified() < cutoff) file.delete()
-                }
-            }
-        }
     }
 }

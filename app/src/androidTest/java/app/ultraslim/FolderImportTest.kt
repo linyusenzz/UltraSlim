@@ -69,6 +69,30 @@ class FolderImportTest {
         assertEquals(1, app.contentResolver.persistedUriPermissions.count { it.uri.authority == tree.authority })
         assertTrue(import(true).startsWith("已导入 0 张照片"))
     }
+    @Test fun singlePhotoGrantsSurviveCrossingTheCleanupThresholdMidBatch() = runBlocking {
+        val testPackage = instrumentation.context.packageName
+        val uris = (0 until 370).map { DocumentsContract.buildDocumentUri("$testPackage.documents", "photo-$it") }
+        fun permissions(action: String) {
+            instrumentation.uiAutomation.executeShellCommand(
+                "am start -W -n $testPackage/app.ultraslim.FolderGrantActivity --es target ${app.packageName} --es singlePhotos $action"
+            ).use { android.os.ParcelFileDescriptor.AutoCloseInputStream(it).readBytes() }
+        }
+        try {
+            permissions("grant")
+            coroutineScope {
+                val finished = async(start = CoroutineStart.UNDISPATCHED) {
+                    withTimeout(120_000) { vm.events.first { it is HomeEvent.Info && it.message.startsWith("已导入") } }
+                }
+                withContext(Dispatchers.Main) { vm.addItems(uris) }
+                finished.await()
+            }
+            val persisted = app.contentResolver.persistedUriPermissions.filter { it.isReadPermission }.map { it.uri }.toSet()
+            assertTrue("Missing persisted grants: ${uris.count { it !in persisted }}", persisted.containsAll(uris))
+            val queued = app.conversionRepository.queue.value.map { it.uri }.toSet()
+            assertTrue(queued.containsAll(uris.map(Uri::toString)))
+        } finally { permissions("revoke") }
+    }
+
     @Test fun albumImportDoesNotTruncateAtOneThousand() = runBlocking {
         val resolver = app.contentResolver
         val created = mutableListOf<Uri>()

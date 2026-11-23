@@ -137,6 +137,9 @@ interface HistoryDao {
     @Query("SELECT id, inputUri, outputUri FROM history")
     suspend fun allPaths(): List<HistoryPaths>
 
+    @Query("SELECT DISTINCT inputUri FROM history WHERE inputUri IN (:uris)")
+    suspend fun referencedInputUris(uris: List<String>): List<String>
+
     /** A concurrent publication must not be overwritten by legacy cache promotion. */
     @Query("UPDATE history SET outputUri = :outputUri WHERE id = :id AND outputUri = :expectedOutputUri")
     suspend fun updateOutputPath(id: Long, expectedOutputUri: String, outputUri: String): Int
@@ -214,6 +217,11 @@ data class BatchEntity(@PrimaryKey val id: String, val itemIds: String, val sett
 @Dao
 interface TaskDao {
     @Query("SELECT * FROM tasks ORDER BY createdAt") suspend fun all(): List<QueueItem>
+    // History is committed before the private file is removed. Repair interrupted queue checkpoints.
+    @Query("""UPDATE tasks SET outputUri = (SELECT h.outputUri FROM history h WHERE h.taskId = tasks.id), error = NULL
+        WHERE status = 'DONE' AND EXISTS (SELECT 1 FROM history h WHERE h.taskId = tasks.id
+        AND h.saveState = 'SAVED' AND h.outputUri LIKE 'content://%' AND tasks.outputUri IS NOT h.outputUri)""")
+    suspend fun restorePublishedTaskOutputs()
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun put(items: List<QueueItem>)
     @Query("DELETE FROM tasks WHERE id IN (:ids)") suspend fun removeIds(ids: List<String>)
     @Transaction suspend fun applyChanges(changed: List<QueueItem>, removed: List<String>) {
@@ -223,7 +231,12 @@ interface TaskDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putBatch(batch: BatchEntity)
     @Query("SELECT * FROM batches ORDER BY createdAt DESC LIMIT 1") suspend fun latestBatch(): BatchEntity?
     @Query("SELECT * FROM batches WHERE id = :id") suspend fun batch(id: String): BatchEntity?
+    // Projected queries avoid copying 78-400 KB itemIds JSON across CursorWindow per photo.
+    @Query("SELECT cancelled FROM batches WHERE id = :id") suspend fun isBatchCancelled(id: String): Boolean?
+    @Query("SELECT settings FROM batches WHERE id = :id") suspend fun batchSettings(id: String): String?
     @Query("UPDATE batches SET cancelled = 1 WHERE id = :id") suspend fun cancel(id: String)
+    @Query("DELETE FROM batches WHERE id NOT IN (SELECT DISTINCT batchId FROM history WHERE batchId != '') AND id NOT IN (SELECT DISTINCT batchId FROM tasks WHERE batchId != '')")
+    suspend fun pruneUnreferencedBatches()
 }
 
 @Database(entities = [HistoryEntity::class, QueueItem::class, BatchEntity::class, ReplacementEntity::class], version = 7, exportSchema = true)

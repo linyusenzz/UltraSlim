@@ -5,11 +5,15 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.ultraslim.UltraSlimApp
+import app.ultraslim.convert.AutoReplacement
 import app.ultraslim.convert.MediaStoreTrashHelper
 import app.ultraslim.convert.OutputStore
+import app.ultraslim.convert.SelectedOutput
+import app.ultraslim.data.ConversionDefaults
 import app.ultraslim.data.HistoryEntity
 import app.ultraslim.data.HistoryPage
 import app.ultraslim.data.HistoryStats
+import app.ultraslim.data.decodeDefaults
 import kotlinx.coroutines.Job
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
@@ -82,7 +86,8 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
                 else missingIds.chunked(500).flatMap { dao.byIds(it) }.associateBy { it.id }
             HistorySelectionState(ids, ids.mapNotNull { inWindow[it] ?: fetched[it] })
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistorySelectionState())
+    }.flowOn(kotlinx.coroutines.Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistorySelectionState())
 
     fun setSelectedIds(ids: Set<Long>) { selectedIds.value = ids.toSet() }
 
@@ -130,7 +135,7 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
         _deleteCandidates.value = emptyList()
         busyJob = viewModelScope.launch {
             try {
-                val active = app.conversionRunning.first()
+                val active = app.isConversionRunning()
                 if (active) {
                     _events.emit("请等待当前转换结束后删除记录")
                     return@launch
@@ -173,7 +178,8 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
             loadingPage = loaded.window != requested,
             windowKey = "${loaded.window.filter}:${loaded.window.before}",
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistoryUiState())
+    }.flowOn(kotlinx.coroutines.Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HistoryUiState())
 
     fun loadMore() {
         if (busyState.value != null || pages.value.window != window.value) return
@@ -194,15 +200,39 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
         busyJob = viewModelScope.launch {
             var done = 0
             var failed = 0
+            val savedByTask = LinkedHashMap<String, HistoryEntity>()
             try {
                 busyState.value = BusyState("保存中", 0, ids.size)
                 val targets = ids.chunked(500).flatMap { dao.byIds(it) }.filter { it.saveState != "SAVED" }
                 busyState.value = BusyState("保存中", 0, targets.size)
+                val directoryCache = SelectedOutput.DirectoryCache()
+                val optionsCache = HashMap<String, ConversionDefaults?>()
                 var processed = 0
                 for (entity in targets) {
                     coroutineContext.ensureActive()
                     try {
-                        if (OutputStore.save(app, entity).saveState == "SAVED") done++ else failed++
+                        val options = optionsCache.getOrPut(entity.batchId) {
+                            app.database.taskDao().batchSettings(entity.batchId)
+                                ?.let { runCatching { decodeDefaults(it) }.getOrNull() }
+                        }
+                        val saved = OutputStore.saveInternal(
+                            app = app,
+                            record = entity,
+                            finalizePublication = false,
+                            knownOptions = options,
+                            directoryCache = directoryCache,
+                        )
+                        if (saved.saveState == "SAVED") {
+                            done++
+                            if (options?.autoReplaceOriginals != false) {
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                                    AutoReplacement.saved(app, saved, outputVerified = true)
+                                }
+                            }
+                        } else {
+                            failed++
+                        }
+                        saved.taskId?.let { savedByTask[it] = saved }
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -214,24 +244,48 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
             } catch (e: kotlinx.coroutines.CancellationException) {
                 _events.emit("已停止保存；已完成的保存保持不变")
             } finally {
+                if (savedByTask.isNotEmpty()) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                        app.conversionRepository.updateAll(savedByTask.keys) { item ->
+                            val saved = savedByTask[item.id] ?: return@updateAll item
+                            item.copy(
+                                outputUri = saved.outputUri,
+                                error = when (saved.saveState) {
+                                    "SAVED" -> null
+                                    "FAILED" -> "保存失败，可在详情重试"
+                                    else -> "转换完成，待保存；可在详情重试"
+                                },
+                            )
+                        }
+                        app.conversionRepository.flush()
+                    }
+                }
                 busyState.value = null
                 busyJob = null
             }
         }
     }
 
-    /** 原图 → MediaStore URI 的解析缓存（含逐条查询）；Default 线程解析，选择时只查表。 */
+    /** 原图 → MediaStore URI 的解析缓存；IO 线程单遍解析并复用已解析 Uri 对象，选择时只查表。 */
     private val trashableCache = MutableStateFlow<Map<Long, Uri>>(emptyMap())
     val trashableOriginals: StateFlow<Map<Long, Uri>> = trashableCache.asStateFlow()
     private val originalUriCache = OriginalUriCache()
+    private val parsedUriCache = java.util.concurrent.ConcurrentHashMap<String, Uri>()
+    private var lastPublishedStrings: Map<Long, String> = emptyMap()
 
     fun refreshOriginals() {
         originalUriCache.invalidate()
+        lastPublishedStrings = emptyMap()
         ensureTrashableResolved((uiState.value.items + selection.value.items).distinctBy { it.id })
     }
 
     private fun publishTrashableCache() {
-        trashableCache.value = originalUriCache.snapshot().mapValues { Uri.parse(it.value) }
+        val snap = originalUriCache.snapshot()
+        if (snap == lastPublishedStrings) return
+        lastPublishedStrings = snap
+        trashableCache.value = snap.mapValues { (_, raw) ->
+            parsedUriCache.computeIfAbsent(raw, Uri::parse)
+        }
     }
 
     /** 补齐缺缓存条目的解析；页面加载或筛选变化时调用，重复调用只解析增量。 */
@@ -245,11 +299,17 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
         viewModelScope.launch {
             try {
                 val resolved = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    val byUri = MediaStoreTrashHelper.originalStates(app, missing.map { Uri.parse(it.uri) })
+                    val active = MediaStoreTrashHelper.activeOriginals(
+                        app,
+                        missing.map { parsedUriCache.computeIfAbsent(it.uri, Uri::parse) },
+                    )
                     missing.mapNotNull { source ->
-                        val parsed = Uri.parse(source.uri)
-                        if (byUri[parsed] != MediaStoreTrashHelper.OriginalState.PRESENT) null
-                        else MediaStoreTrashHelper.resolveToMediaStoreImageUri(app, parsed)?.let { source to it.toString() }
+                        val parsed = parsedUriCache.computeIfAbsent(source.uri, Uri::parse)
+                        active[parsed]?.let { canonical ->
+                            val canonicalStr = canonical.toString()
+                            parsedUriCache.putIfAbsent(canonicalStr, canonical)
+                            source to canonicalStr
+                        }
                     }.toMap()
                 }
                 originalUriCache.complete(missing, resolved)
@@ -286,7 +346,7 @@ class HistoryViewModel(private val app: UltraSlimApp) : ViewModel() {
         if (busyState.value != null) return
         busyJob = viewModelScope.launch {
             try {
-                val active = app.conversionRunning.first()
+                val active = app.isConversionRunning()
                 if (active) {
                     _events.emit("请等待当前转换结束后清空历史")
                     return@launch

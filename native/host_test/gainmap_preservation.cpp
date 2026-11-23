@@ -50,9 +50,9 @@ static std::vector<uint8_t> jpeg(int w,int h,bool multi,int orientation,bool row
  while(c.next_scanline<c.image_height){for(int x=0;x<w;x++)for(int ch=0;ch<c.input_components;ch++)row[x*c.input_components+ch]=rowBands ? ((c.next_scanline*17)%192+x%16+ch*16)%256 : (x*7+c.next_scanline*11+ch*73)%256;JSAMPROW r=row.data();jpeg_write_scanlines(&c,&r,1);}
  jpeg_finish_compress(&c);std::vector<uint8_t> out(mem,mem+len);free(mem);jpeg_destroy_compress(&c);return out;
 }
-static void fixture(const std::string& path,bool multi,int orientation,int gw=41,int gh=25,int bw=163,int bh=99,bool rowBands=false){
+static void fixture(const std::string& path,bool multi,int orientation,int gw=41,int gh=25,int bw=163,int bh=99,bool rowBands=false,bool sharedBoost=false){
  auto b=jpeg(bw,bh,true,orientation,rowBands),g=jpeg(gw,gh,multi,0);auto*e=uhdr_create_encoder();uhdr_compressed_image_t base{},gm{};base.data=b.data();base.data_sz=base.capacity=b.size();base.cg=UHDR_CG_BT_709;base.ct=UHDR_CT_SRGB;base.range=UHDR_CR_FULL_RANGE;gm=base;gm.data=g.data();gm.data_sz=gm.capacity=g.size();
- uhdr_gainmap_metadata_t m{};for(int i=0;i<3;i++){m.min_content_boost[i]=1;m.max_content_boost[i]=4+i;m.gamma[i]=1;m.offset_sdr[i]=m.offset_hdr[i]=1.0f/64;}m.hdr_capacity_min=1;m.hdr_capacity_max=8;m.use_base_cg=1;
+ uhdr_gainmap_metadata_t m{};for(int i=0;i<3;i++){m.min_content_boost[i]=1;m.max_content_boost[i]=sharedBoost?4:4+i;m.gamma[i]=1;m.offset_sdr[i]=m.offset_hdr[i]=1.0f/64;}m.hdr_capacity_min=1;m.hdr_capacity_max=8;m.use_base_cg=1;
  check(uhdr_enc_set_compressed_image(e,&base,UHDR_BASE_IMG).error_code==UHDR_CODEC_OK,"set base");check(uhdr_enc_set_gainmap_image(e,&gm,&m).error_code==UHDR_CODEC_OK,"set gain map");check(uhdr_encode(e).error_code==UHDR_CODEC_OK,"mux fixture");auto*r=uhdr_get_encoded_stream(e);FILE*f=fopen(path.c_str(),"wb");fwrite(r->data,1,r->data_sz,f);fclose(f);uhdr_release_encoder(e);
 }
 static std::vector<uint8_t> scanData(const std::vector<uint8_t>& jpeg) {
@@ -156,6 +156,20 @@ int main(int argc,char**argv){
     check(std::abs(before-after)/(a.w*a.h)<3,"compatible RGB map keeps channel averages");
    }
   }
+ }
+ // Equal gain bounds still permit different RGB samples in a compatible HEIC.
+ {
+  const auto src=root+"/shared-boost.jpg", dst=root+"/shared-boost.heic";
+  fixture(src,true,1,41,25,163,99,false,true);
+  convert(src,dst,1,100,2,false,90,false,true);
+  const auto expected=map(dst,false);
+  ultraslim::PreviewGainmapData preview;
+  int fd=open(dst.c_str(),O_RDONLY);
+  check(fd>=0 && ultraslim::decodePreviewGainmap(fd,256,128u*1024*1024,preview),"decode color gain map for preview");
+  close(fd);
+  check(!preview.singleChannel && preview.pixels.size()==size_t(expected.w)*expected.h*4,"keep RGB preview channels");
+  for(size_t i=0;i<expected.rgb.size();i++)
+   check(preview.pixels[(i/3)*4+i%3]==expected.rgb[i],"match decoded HEIC gain map samples");
  }
  // Switching compatibility must never reuse a cached strict map, or vice versa.
  for(bool multi:{false,true}) {

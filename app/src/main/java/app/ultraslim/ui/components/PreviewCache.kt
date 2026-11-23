@@ -5,25 +5,34 @@ import android.content.Context
 import app.ultraslim.convert.ConversionBudget
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ColorSpace
+import android.graphics.Gainmap
+import android.graphics.ImageDecoder
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.LruCache
+import androidx.annotation.RequiresApi
 import app.ultraslim.bridge.UltraHdrBridge
 import app.ultraslim.convert.ImageWork
+import app.ultraslim.convert.MediaStoreSaver
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
 import kotlinx.coroutines.sync.withLock
 
 /**
- * JPEG bytes from [UltraHdrBridge.nativeDecodePreview], kept in memory (~32MB)
+ * Decoded preview bitmaps from [UltraHdrBridge.nativeDecodePreviewBitmap], kept in memory
  * and under cacheDir/previews (newest 200 files).
  */
 internal object PreviewCache {
     private const val THUMB_MAX_DIM = 512
     private const val THUMB_MAX_BYTES = 12 * 1024 * 1024
-    private const val DETAIL_MAX_BYTES = 28 * 1024 * 1024
+    // Two 2048x2048 ARGB_8888 detail bitmaps occupy 33.55 MiB; 34 MiB avoids mutual eviction.
+    private const val DETAIL_MAX_BYTES = 34 * 1024 * 1024
     private const val MAX_DISK_FILES = 200
     private const val TRIM_INTERVAL = 16
+    private const val CACHE_VERSION = "v7"
 
     // 列表缩略图（<=512）与详情页大图（1600/2048）分池管理：
     // 防止详情页两张 2048px RGBA（约 25MB）把整页列表缩略图挤出内存缓存。
@@ -49,20 +58,29 @@ internal object PreviewCache {
     private val versionCache = object : LruCache<String, Pair<String, Long>>(512) {}
 
     private fun versionOf(context: Context, uriString: String): String? {
+        val now = System.currentTimeMillis()
         if (uriString.startsWith("content://")) {
             versionCache.get(uriString)?.let { (cached, at) ->
-                if (System.currentTimeMillis() - at < VERSION_TTL_MS) return cached
+                if (now - at < VERSION_TTL_MS) return cached
             }
         }
         val version = getVersion(context, uriString) ?: return null
-        if (uriString.startsWith("content://")) versionCache.put(uriString, version to System.currentTimeMillis())
+        versionCache.put(uriString, version to now)
         return version
+    }
+
+    /** Zero-IO memory lookup for Compose initial state, preventing spinner flicker on scroll-back. */
+    fun peek(uriString: String, requestedDim: Int): Bitmap? {
+        val (version, _) = versionCache.get(uriString) ?: return null
+        val maxDim = resolutions.firstOrNull { it >= requestedDim } ?: 4096
+        val key = cacheKey("$uriString:$version:$CACHE_VERSION", maxDim)
+        return cacheFor(maxDim).get(key)
     }
 
     suspend fun load(context: Context, uriString: String, requestedDim: Int): Bitmap? {
         val maxDim = resolutions.firstOrNull { it >= requestedDim } ?: 4096
         val version = versionOf(context, uriString) ?: return null
-        val key = cacheKey("$uriString:$version:v6", maxDim)
+        val key = cacheKey("$uriString:$version:$CACHE_VERSION", maxDim)
 
         val mem = cacheFor(maxDim)
         // 1. Fast-path: In-memory cache hit (LruCache is internally synchronized; no diskLock needed)
@@ -73,13 +91,12 @@ internal object PreviewCache {
         return requestLocks[(uriString.hashCode() and Int.MAX_VALUE) % requestLocks.size].withLock {
             mem.get(key)?.let { return@withLock it }
             val dir = File(context.cacheDir, "previews")
-            val file = File(dir, "$key.jpg")
-            readCached(file, key, maxDim)?.let { return@withLock it }
+            readCached(dir, key, maxDim)?.let { return@withLock it }
             // Detail previews can supply list thumbnails without decoding the original again.
             for (dimension in resolutions.filter { it > maxDim }) {
-                val largerKey = cacheKey("$uriString:$version:v6", dimension)
+                val largerKey = cacheKey("$uriString:$version:$CACHE_VERSION", dimension)
                 val larger = cacheFor(dimension).get(largerKey)
-                    ?: readCached(File(dir, "$largerKey.jpg"), largerKey, dimension, sampleTo = maxDim)
+                    ?: readCached(dir, largerKey, dimension, sampleTo = maxDim)
                 if (larger != null) {
                     val edge = maxOf(larger.width, larger.height)
                     val bitmap = if (edge <= maxDim) larger else Bitmap.createScaledBitmap(larger,
@@ -94,23 +111,129 @@ internal object PreviewCache {
             val stage = if (maxDim <= THUMB_MAX_DIM) "thumb $maxDim" else "preview $maxDim"
             val bitmap = decodeBitmap(context, uriString, maxDim, stage) ?: return@withLock null
             mem.put(key, bitmap)
-            synchronized(diskLock) {
-                dir.mkdirs()
-                runCatching {
-                    file.outputStream().use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 82, out) }
+            val hasAlpha = bitmap.hasAlpha()
+            val format = if (hasAlpha) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val file = File(dir, if (hasAlpha) "$key.png" else "$key.jpg")
+            // Compress outside diskLock so a detail preview never stalls other disk writes.
+            val encoded = runCatching {
+                ByteArrayOutputStream(32 * 1024).use { buf ->
+                    if (bitmap.compress(format, 82, buf)) buf.toByteArray() else null
                 }
-                val n = writesSinceTrim.incrementAndGet()
-                if (n == 1 || n % TRIM_INTERVAL == 0) trim(dir)
+            }.getOrNull()
+            if (encoded != null && encoded.isNotEmpty()) {
+                synchronized(diskLock) {
+                    dir.mkdirs()
+                    val tmp = File(dir, "$key.tmp")
+                    try {
+                        tmp.writeBytes(encoded)
+                        if (!tmp.renameTo(file)) {
+                            tmp.copyTo(file, overwrite = true)
+                        }
+                    } catch (_: Exception) {
+                        // Disk cache is best-effort; memory cache already holds the decoded bitmap.
+                    } finally {
+                        if (tmp.exists()) tmp.delete()
+                    }
+                    val n = writesSinceTrim.incrementAndGet()
+                    if (n == 1 || n % TRIM_INTERVAL == 0) trim(dir)
+                }
             }
             bitmap
+        }
+    }
+
+    /**
+     * Decodes a software [Bitmap] carrying an Android 14+ [Gainmap] for interactive HDR preview
+     * in DetailScreen. Android 16+ can use platform [ImageDecoder] before falling back to native
+     * gain-map extraction, which also covers JXL and strict ISO 21496-1 HEIC/AVIF.
+     */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    suspend fun loadHdr(context: Context, uriString: String, requestedDim: Int): Bitmap? {
+        val maxDim = resolutions.firstOrNull { it >= requestedDim } ?: 4096
+        // Older ImageDecoder versions cannot tell us if the map uses a different gamut.
+        if (Build.VERSION.SDK_INT >= 36 && !uriString.endsWith(".jxl", ignoreCase = true)) {
+            val platformDecoded = runCatching {
+                val source = if (uriString.startsWith("content://")) {
+                    ImageDecoder.createSource(context.contentResolver, Uri.parse(uriString))
+                } else {
+                    ImageDecoder.createSource(File(uriString))
+                }
+                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val edge = maxOf(info.size.width, info.size.height)
+                    decoder.setTargetSampleSize(maxOf(1, (edge + maxDim - 1) / maxDim))
+                    decoder.setOnPartialImageListener { false }
+                }
+            }.getOrNull()
+            if (platformDecoded != null) {
+                if (platformDecoded.hasGainmap()) return platformDecoded
+                platformDecoded.recycle()
+            }
+        }
+        val sdr = load(context, uriString, maxDim) ?: return null
+        val baseCopy = sdr.copy(Bitmap.Config.ARGB_8888, false) ?: return sdr
+        val attached = runCatching {
+            val pfd = if (uriString.startsWith("content://")) {
+                context.contentResolver.openFileDescriptor(Uri.parse(uriString), "r")
+            } else {
+                ParcelFileDescriptor.open(File(uriString), ParcelFileDescriptor.MODE_READ_ONLY)
+            } ?: return@runCatching false
+            val meta = FloatArray(18)
+            val gmBitmap = pfd.use { fd ->
+                ImageWork.run("hdr-gainmap $maxDim") {
+                    val info = ActivityManager.MemoryInfo().also {
+                        context.getSystemService(ActivityManager::class.java).getMemoryInfo(it)
+                    }
+                    val budget = ConversionBudget.previewBytes(info.availMem, info.totalMem, info.threshold, info.lowMemory)
+                    if (budget == 0L) null else UltraHdrBridge.nativeDecodeGainmapBitmap(fd.fd, maxDim, budget, meta)
+                }
+            } ?: return@runCatching false
+            val alternatePrimaries = when (meta[17].toInt()) {
+                1 -> ColorSpace.get(ColorSpace.Named.SRGB)
+                9 -> ColorSpace.get(ColorSpace.Named.BT2020)
+                12 -> ColorSpace.get(ColorSpace.Named.DISPLAY_P3)
+                else -> null
+            }
+            if (alternatePrimaries != null && Build.VERSION.SDK_INT < 36) {
+                // Older Android releases can only calculate the gain map in the base gamut.
+                val base = baseCopy.colorSpace as? ColorSpace.Rgb
+                val alternate = alternatePrimaries as ColorSpace.Rgb
+                if (base == null || !base.primaries.contentEquals(alternate.primaries)) {
+                    gmBitmap.recycle()
+                    return@runCatching false
+                }
+            }
+            val minHdrRatio = meta[15].coerceAtLeast(1f)
+            val gainmap = Gainmap(gmBitmap).apply {
+                if (alternatePrimaries != null && Build.VERSION.SDK_INT >= 36) {
+                    setAlternativeImagePrimaries(alternatePrimaries)
+                }
+                setRatioMin(meta[0], meta[1], meta[2])
+                setRatioMax(meta[3], meta[4], meta[5])
+                // libultrahdr stores the encoding exponent. Android takes the decoding exponent.
+                setGamma(1f / meta[6], 1f / meta[7], 1f / meta[8])
+                setEpsilonSdr(meta[9], meta[10], meta[11])
+                setEpsilonHdr(meta[12], meta[13], meta[14])
+                setMinDisplayRatioForHdrTransition(minHdrRatio)
+                setDisplayRatioForFullHdr(maxOf(meta[16], minHdrRatio))
+            }
+            baseCopy.setGainmap(gainmap)
+            true
+        }.getOrDefault(false)
+        return if (attached) baseCopy else {
+            baseCopy.recycle()
+            sdr
         }
     }
 
     // Decoded outside diskLock; corrupt entries are removed and decoded again on demand.
     // sampleTo > 0 时按目标尺寸带 inSampleSize 解码，且不按原 key 入内存缓存
     // （降采样结果不应占大图档位的缓存位）。
-    private fun readCached(file: File, key: String, maxDim: Int, sampleTo: Int = 0): Bitmap? {
+    private fun readCached(dir: File, key: String, maxDim: Int, sampleTo: Int = 0): Bitmap? {
+        val png = File(dir, "$key.png")
+        val file = if (png.isFile) png else File(dir, "$key.jpg")
         if (!file.isFile || file.length() == 0L) return null
+        val mayUseRgb565 = file.extension == "jpg"
         val bitmap = if (sampleTo > 0) {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -119,9 +242,9 @@ internal object PreviewCache {
             while (edge / (sample * 2) >= sampleTo) sample *= 2
             BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
                 inSampleSize = sample
-                if (sampleTo <= THUMB_MAX_DIM) inPreferredConfig = Bitmap.Config.RGB_565
+                if (mayUseRgb565 && sampleTo <= THUMB_MAX_DIM) inPreferredConfig = Bitmap.Config.RGB_565
             })
-        } else if (maxDim <= THUMB_MAX_DIM) {
+        } else if (mayUseRgb565 && maxDim <= THUMB_MAX_DIM) {
             BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.RGB_565
             })
@@ -186,18 +309,40 @@ internal object PreviewCache {
     }.getOrNull()
 
     private fun trim(dir: File) {
-        val files = dir.listFiles() ?: return
+        val allFiles = dir.listFiles() ?: return
+        val now = System.currentTimeMillis()
+        val files = ArrayList<File>(allFiles.size)
+        for (f in allFiles) {
+            if (f.name.endsWith(".tmp")) {
+                if (now - f.lastModified() > 60_000L) f.delete()
+            } else {
+                files += f
+            }
+        }
         var bytes = files.sumOf { it.length() }
         var count = files.size
         files.sortedBy { it.lastModified() }.forEach { file ->
-            if(count > MAX_DISK_FILES || bytes > 128L * 1024 * 1024) { val n=file.length(); if(file.delete()){bytes-=n;count--;} }
+            if (count > MAX_DISK_FILES || bytes > 128L * 1024 * 1024) {
+                val n = file.length()
+                if (file.delete()) { bytes -= n; count-- }
+            }
+        }
+    }
+
+    /** Cleans leftover `.tmp` files and enforces the 200-file / 128 MiB cache bound. */
+    fun cleanStartup(context: Context) {
+        synchronized(diskLock) {
+            val dir = File(context.cacheDir, "previews")
+            if (!dir.isDirectory) return
+            dir.listFiles()?.forEach { if (it.name.endsWith(".tmp")) it.delete() }
+            trim(dir)
         }
     }
 
     private fun cacheKey(uriString: String, maxDim: Int): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest("$maxDim\n$uriString".toByteArray(Charsets.UTF_8))
-        return bytes.joinToString("") { "%02x".format(it) }
+        return MediaStoreSaver.hex(bytes)
     }
 
     fun clear(context: Context) {

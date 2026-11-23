@@ -19,7 +19,9 @@ abstract class GenerateOpenSourceNotices : DefaultTask() {
         }
         text.append("\n===== 本次 Release 运行时依赖 =====\n")
         text.append(components.get().sorted().joinToString("\n")).append('\n')
-        // Preserve notices in each AAR and its nested classes/libs JARs before packaging excludes.
+        // Preserve notices in each AAR and its nested classes/libs JARs before packaging excludes,
+        // grouping identical license bodies so 80+ identical Apache-2.0 copies are stored once.
+        val groupedNotices = LinkedHashMap<String, MutableList<String>>()
         fun scan(bytes: ByteArray, label: String) {
             ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
                 while (true) {
@@ -27,12 +29,20 @@ abstract class GenerateOpenSourceNotices : DefaultTask() {
                     if (entry.isDirectory) continue
                     val name = entry.name.substringAfterLast('/').uppercase()
                     if (name.contains("LICENSE") || name.contains("NOTICE") || name.startsWith("COPYING") || name == "COPYRIGHT") {
-                        text.append("\n===== $label/${entry.name} =====\n").append(zip.readBytes().toString(Charsets.UTF_8)).append('\n')
+                        val body = zip.readBytes().toString(Charsets.UTF_8).replace("\r\n", "\n").trim()
+                        if (body.isNotEmpty()) {
+                            groupedNotices.getOrPut(body) { mutableListOf() }.add("$label/${entry.name}")
+                        }
                     } else if (entry.name.endsWith(".jar")) scan(zip.readBytes(), "$label/${entry.name}")
                 }
             }
         }
         runtimeArchives.files.sortedBy { it.name }.forEach { scan(it.readBytes(), it.name) }
+        groupedNotices.forEach { (body, sources) ->
+            val header = if (sources.size == 1) sources.single()
+                else "${sources.first()} (+${sources.size - 1} 项相同许可)\n适用组件：\n" + sources.joinToString("\n") { "  - $it" }
+            text.append("\n===== $header =====\n").append(body).append('\n')
+        }
         output.resolve("open-source-notices.txt").writeText(text.toString())
     }
 }
@@ -63,8 +73,8 @@ android {
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // 公开发行版仍沿用测试期递增的 versionCode，确保覆盖升级。
-        versionCode = 26
-        versionName = "1.0.3"
+        versionCode = 27
+        versionName = "1.0.4"
 
         // App 自身只有中文文案；剥掉 androidx/Compose 带入的其他语言资源。
         // AGP 9 起 resourceConfigurations 已弃用（Gradle 9.6 有显式警告）。
@@ -119,7 +129,9 @@ android {
     externalNativeBuild {
         cmake {
             path = file("../native/CMakeLists.txt")
-            providers.environmentVariable("ULTRASLIM_BUILD_ROOT").orNull?.let { buildStagingDirectory = file("$it/cxx") }
+            providers.gradleProperty("ultraslimBuildRoot")
+                .orElse(providers.environmentVariable("ULTRASLIM_BUILD_ROOT"))
+                .orNull?.let { buildStagingDirectory = file("$it/cxx") }
             version = "3.22.1"
         }
     }
@@ -139,7 +151,8 @@ android {
     val screenshotReferenceDir = file("src/screenshotTestDebug/reference").absoluteFile
     val screenshotProjectRoot = rootProject.projectDir.absoluteFile
     tasks.withType<Test>().configureEach {
-        if (name.startsWith("validate") && name.endsWith("ScreenshotTest")) {
+        jvmArgs("-Dfile.encoding=UTF-8", "-Dsun.jnu.encoding=UTF-8")
+        if ((name.startsWith("validate") || name.startsWith("update")) && name.endsWith("ScreenshotTest")) {
             doFirst {
                 // 测试引擎直接解析 referenceImageDir，不能让模块工作目录拼出 app/app/src。
                 systemProperty("PreviewScreenshotTestEngineInput.referenceImageDir", screenshotReferenceDir.absolutePath)
@@ -169,6 +182,7 @@ android {
             // Keep AndroidX version metadata for Compose Layout Inspector / Android CLI.
             excludes += setOf(
                 "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+                "META-INF/**/LICENSE*", "META-INF/**/NOTICE*",
                 "META-INF/*.kotlin_module", "META-INF/versions/**", "META-INF/INDEX.LIST",
                 "META-INF/proguard/**", "META-INF/com.android.tools/**",
                 "META-INF/gradle/incremental.annotation.processors",

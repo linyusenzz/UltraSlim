@@ -87,6 +87,28 @@ class ConversionFreshnessTest {
         }
     }
 
+    @Test fun changedMotionPhotoUsesCurrentSizeForOnlySmaller() = runBlocking {
+        val options = ConversionDefaults(format = OutputFormat.JPEG, quality = 100,
+            allowSdr = true, autoSave = false, onlySmaller = true)
+        withBatch(options) { id, input, _ ->
+            fun box(type: String, body: ByteArray): ByteArray =
+                java.nio.ByteBuffer.allocate(8 + body.size)
+                    .putInt(8 + body.size).put(type.toByteArray(Charsets.US_ASCII)).put(body).array()
+            val video = box("ftyp", "isom0000".toByteArray()) + box("moov", byteArrayOf()) +
+                box("mdat", ByteArray(4096))
+            app.conversionRepository.update(id) { it.copy(sizeBytes = 1024L * 1024) }
+            input.appendBytes(video)
+            val currentSize = input.length()
+            assertEquals(ConversionRunner.Outcome.COMPLETE, ConversionRunner(app, thermalStatus = { 0 }) {}.run(id))
+            val item = app.conversionRepository.find(id)!!
+            assertEquals(item.error, QueueStatus.SKIPPED, item.status)
+            val result = requireNotNull(item.result)
+            assertEquals(currentSize, result.inputBytes)
+            assertTrue(result.outputBytes >= currentSize)
+            assertNull(app.database.historyDao().byTask(id))
+        }
+    }
+
     @Test fun cancellationDuringReplacementPreparationKeepsPrivateResultPending() = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= 29)
         val wasAllowed = app.galleryPublishingAllowed.value

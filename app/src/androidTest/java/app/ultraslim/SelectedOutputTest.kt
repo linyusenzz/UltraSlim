@@ -61,6 +61,25 @@ class SelectedOutputTest {
         assertArrayEquals(second.readBytes(), context.contentResolver.openInputStream(result)!!.use { it.readBytes() })
     }
 
+    @Test fun retainedAlbumNameCountsUnicodeEquivalentNamesBeforeChoosingSuffix() {
+        val path = "Pictures/UltraSlimTest-${UUID.randomUUID()}/"
+        val image = source()
+        val bitmap = android.graphics.Bitmap.createBitmap(8, 8, android.graphics.Bitmap.Config.ARGB_8888)
+        image.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, it) }
+        bitmap.recycle()
+        val created = mutableListOf<Uri>()
+        try {
+            for (name in listOf("e\u0301.jpg", "É (1).jpg")) {
+                created += requireNotNull(MediaStoreSaver.save(context, image, name, OutputFormat.JPEG, relativePath = path))
+            }
+            val output = SelectedOutput.save(context, image, "é.jpg", OutputFormat.JPEG, null,
+                MediaStoreSaver.fingerprintOf(image)!!, SourceTimestamps(), {}, path = path,
+                directoryCache = SelectedOutput.DirectoryCache())
+            created += output
+            assertEquals("é (2).jpg", SelectedOutput.displayName(context, output))
+        } finally { created.forEach { context.contentResolver.delete(it, null, null) } }
+    }
+
     @Test fun cancellationDuringCopyDeletesOnlyNewDocumentAndKeepsPrivateBytes() {
         val existing = save(source()); val file = source(); val original = file.readBytes(); var checks = 0
         try { save(file) { if (++checks == 5) throw CancellationException("test cancel") }; fail("expected cancellation") }

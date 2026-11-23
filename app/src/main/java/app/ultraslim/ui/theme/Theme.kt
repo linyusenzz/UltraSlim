@@ -63,8 +63,8 @@ fun AppTheme(themeMode: ThemeMode = ThemeMode.SYSTEM, dynamicColor: Boolean = fa
     // 用户强制浅色/深色时会出现白图标贴浅底。
     val view = androidx.compose.ui.platform.LocalView.current
     if (!view.isInEditMode) {
-        androidx.compose.runtime.SideEffect {
-            val activity = view.context as? androidx.activity.ComponentActivity ?: return@SideEffect
+        androidx.compose.runtime.LaunchedEffect(view, dark) {
+            val activity = view.context as? androidx.activity.ComponentActivity ?: return@LaunchedEffect
             val style = SystemBarStyle.auto(
                 android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT,
             ) { dark }
